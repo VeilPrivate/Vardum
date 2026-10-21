@@ -9,11 +9,15 @@ import { parseCallSignal, type CallSignal } from './calls';
 import {
   encryptMessage, decryptMessage, completeHandshake,
   deserializeRatchetState, serializeRatchetState, senderPseudonym,
-  toB64, fromB64, splitForBuckets,
+  toB64, fromB64, splitForBuckets, clampDials, type DialsInput,
 } from '../../crypto-core/src/index';
 import type { VeilRelay, SessionStore } from './index.js';
+import { saveOrThrow } from './save-strict';
 import { relayTimestampToIso } from './time';
 import { serializeRatchetSend } from './send-queue';
+import { relaySessionLiveness } from './session-liveness';
+import { PEEK_DIALS_BURN_FLOOR_SECONDS } from './invite';
+import { pageBacklog } from './backfill';
 
 /** Media message descriptor — the web bundle's __veil_media payload (parser
  *  Hp). Media messages carry text:'' and render from these fields instead. */
@@ -40,8 +44,12 @@ export interface ChatMessage {
   mine: boolean;
   ts: string | null;
   media?: ChatMedia;
+  /** b199: a group invitation card (text is '' for these) */
+  groupInvite?: ChatGroupInvite;
   /** set on MY messages when a peer receipt confirms read:true (web read-receipt parity) */
   read?: boolean;
+  /** b199: one reaction per side (pairwise threads) */
+  reactions?: { mine?: string; peer?: string };
   /** relay record id captured from the submitEnvelope response (web envelopeId
    *  parity) — MY messages match incoming receipt ids on this, not the local id */
   envId?: string;
@@ -50,6 +58,8 @@ export interface ChatMessage {
    *  creation on the receive/send path; older cached rows without it are
    *  stamped on first display by SessionStore.ensureOpenedAt(). */
   openedAt?: number;
+  /** Play UGC: the sender's Vardum ID on received group/forum rows (block list match) */
+  senderVid?: string;
 }
 
 /** b82 EMERGENCY KILL-SWITCH for burn-after-open calls.
@@ -95,6 +105,13 @@ export interface SyncResult {
    *  rate limiter. Caller should back off its poll interval instead of
    *  retrying at full speed — see App.tsx syncToken. */
   rateLimited?: boolean;
+  /** Batch E (Superagent round 3, F-1): burns the relay keeps refusing after
+   *  the fast retries — still queued (with backoff), shown in the thread. */
+  burnStuck?: number;
+  /** Batch H (R6-1-06): this phone's storage refused the chat state this pass */
+  stateNotSaved?: boolean;
+  /** Batch H (R5-1-09): the burn queue could not be saved, or is full */
+  burnQueueTrouble?: boolean;
   messages: ChatMessage[];
   /** every envelope id decrypted this pass — including filtered control/cover
    *  ones — so the caller's knownIds set stays complete (a consumed ratchet
@@ -103,8 +120,15 @@ export interface SyncResult {
   /** ids of MY messages the peer confirmed READ (receipt payloads with
    *  read:true) — caller marks those bubbles read (web parity). */
   readIds: string[];
+  /** b199 reactions: the peer's reaction changes this pass, in order —
+   *  target = the reacted message's envelope id, emoji null = removed. */
+  reactions?: { target: string; emoji: string | null }[];
   state: import('../../crypto-core/src/index').RatchetStateSerialized;
 }
+
+/** b199 (owner request, Oct 17): hold a message to react. The only emoji a
+ *  reaction may carry — anything else received is ignored. */
+export const REACTION_EMOJI = ['👍', '👎', '❤️', '🙏', '😂', '😮'] as const;
 
 interface EnvelopeRecord {
   id?: string;
@@ -159,12 +183,124 @@ function extractEnvelopes(data: unknown): EnvelopeRecord[] {
  * change fails the AES-GCM tag on every message, silently). Object form is a
  * legacy fallback only; the string form round-trips untouched.
  */
-/** non-ratchet fields that must survive every reseal (serialize drops them) */
+/** non-ratchet fields that must survive every reseal (serialize drops them).
+ *  Batch D (D-09, RV-07): ALL the dials, not only burnAfterOpen — before this the
+ *  expiry and burn dials were dropped by the first reseal, so every envelope
+ *  after the first fell back to a 24 h expiry. */
+// Batch F (R4-1-04): plus who the chat is with (sealed at the contact handshake)
+// Batch F (R4-1-03): plus this phone's own safety-code confirmation; (R4-1-01) where the dials came from
+const SEALED_DIAL_FIELDS = ['burnAfterOpen', 'defaultTtlSeconds', 'expireAfterSeconds', 'keyRetentionHours', 'peerVeilId', 'peerIkPub', 'myVerifiedFp', 'dialsSource'] as const;
 function withExtras(serialized: unknown, sealed: unknown): never {
   const extras: Record<string, unknown> = {};
-  const b = (sealed as { burnAfterOpen?: boolean }).burnAfterOpen;
-  if (b !== undefined) extras.burnAfterOpen = b;
+  for (const f of SEALED_DIAL_FIELDS) {
+    const v = (sealed as Record<string, unknown>)[f];
+    if (v !== undefined) extras[f] = v;
+  }
   return { ...(serialized as Record<string, unknown>), ...extras } as never;
+}
+
+/**
+ * Batch D (D-09): the session's dials. The signed transcript copy (state.dials,
+ * bound into the fingerprint since V-12) comes first; sessions from before it
+ * use the copy sealed at completion. Never the relay row.
+ */
+export function sessionDials(sealed: unknown): DialsInput | null {
+  const s = (sealed ?? {}) as { dials?: unknown; burnAfterOpen?: unknown; defaultTtlSeconds?: unknown; expireAfterSeconds?: unknown; keyRetentionHours?: unknown };
+  if (typeof s.dials === 'string') {
+    const m = /^t=(\d+);e=(\d+);r=(\d+);b=([01])$/.exec(s.dials);
+    if (m) return clampDials({ defaultTtlSeconds: Number(m[1]), expireAfterSeconds: Number(m[2]), keyRetentionHours: Number(m[3]), burnAfterOpen: m[4] === '1' });
+  }
+  if (s.defaultTtlSeconds !== undefined || s.expireAfterSeconds !== undefined || s.keyRetentionHours !== undefined) {
+    return clampDials({
+      defaultTtlSeconds: s.defaultTtlSeconds as number, expireAfterSeconds: s.expireAfterSeconds as number,
+      keyRetentionHours: s.keyRetentionHours as number, burnAfterOpen: s.burnAfterOpen === true,
+    });
+  }
+  return null;
+}
+
+/**
+ * Batch F (round-4 review R4-1-03): did the user on THIS phone confirm the
+ * safety code for the session's current fingerprint? The relay's per-side
+ * "verified" flags are only hints for the badge; a relay could set them. The
+ * send gate needs this local confirmation. Bound to the fingerprint, so a key
+ * change (a new fingerprint) needs a new confirmation.
+ */
+export function locallyVerified(sealed: unknown): boolean {
+  const s = (sealed ?? null) as { fingerprint?: string | null; myVerifiedFp?: unknown } | null;
+  if (!s || typeof s.myVerifiedFp !== 'string' || !s.myVerifiedFp) return false;
+  // Batch G (round-5 NF-1 / R5-1-07): no fingerprint on this phone = nothing was compared
+  if (typeof s.fingerprint !== 'string' || !s.fingerprint) return false;
+  return s.myVerifiedFp === s.fingerprint;
+}
+
+/** Batch H (round-6 review R6-1-05): a key-change revocation clears the sealed
+ *  confirmation, so it survives a restart and a fresh comparison is needed. */
+export async function clearLocalVerification(sessions: SessionStore, token: string): Promise<void> {
+  await serializeRatchetSend(token, async () => {
+    const sealed = await sessions.load(token);
+    if (!sealed || !(sealed as { myVerifiedFp?: string }).myVerifiedFp) return;
+    const { myVerifiedFp: _gone, ...rest } = sealed as unknown as Record<string, unknown>;
+    void _gone;
+    // Batch I (local review V-03): a refused save used to resolve quietly and
+    // the confirmation came back after a restart. It's reported now; the app
+    // keeps the gate closed and retries.
+    if ((await sessions.save(token, rest as never)) === false) {
+      throw new Error('The key-change revocation could not be saved on this phone.');
+    }
+  });
+}
+
+/** Batch F (R4-1-03): seal "I compared the codes and they match" for the session's
+ *  current fingerprint. Runs under the session's ratchet lock so a sync or send
+ *  in flight can't write over it. */
+export async function markLocallyVerified(sessions: SessionStore, token: string): Promise<void> {
+  await serializeRatchetSend(token, async () => {
+    const sealed = await sessions.load(token);
+    if (!sealed) throw new Error('No ratchet state for this session on this device.');
+    const fp = (sealed as { fingerprint?: string | null }).fingerprint;
+    // Batch G (NF-1): never seal a confirmation without a safety code to compare
+    if (typeof fp !== 'string' || !fp) throw new Error('This chat has no safety code on this phone, so it can’t be verified.');
+    await sessions.save(token, { ...(sealed as unknown as Record<string, unknown>), myVerifiedFp: fp } as never);
+  });
+}
+
+/**
+ * Batch E (round-3 review F-14): text the user typed is never a control post.
+ * Text that happens to start like one ({"__veil_...) gets an invisible word
+ * joiner in front, so receivers show it as text and the send-side control
+ * exemptions (eviction pending, stale member key) don't apply to it.
+ */
+export function userText(text: string): string {
+  // Batch F (R4-4-15): any text that starts like JSON (the 1:1 classifier parses
+  // JSON and matches keys anywhere), not only a literal {"__veil_ prefix
+  return text.trimStart().startsWith('{') ? '\u2060' + text : text;
+}
+
+/**
+ * Batch E (round-3 review R1-01): the burn window used to purge local
+ * plaintext. The session's own dials (signed transcript copy, else the copy
+ * sealed at completion) always win; the relay row's dials are used only for a
+ * legacy thread that has no local dials at all (disclosed residual). Before
+ * this, closed threads purged on the row alone, so the relay could set a 1 s
+ * burn and wipe history early.
+ */
+export function burnWindow(sealed: unknown, row?: { burn: boolean; burnSecs: number }): { burn: boolean; secs: number } {
+  const d = sessionDials(sealed);
+  // Batch F (R4-1-01): dials a joiner took from the relay (an older link) only
+  // ever lengthen the local window, never shorten it
+  if (d && (sealed as { dialsSource?: unknown } | null)?.dialsSource === 'peek') {
+    return { burn: !!d.burnAfterOpen, secs: Math.max(Number(d.defaultTtlSeconds) || 0, PEEK_DIALS_BURN_FLOOR_SECONDS) };
+  }
+  if (d) {
+    // a b74-era web-joined thread sealed its TTL but not the burn flag: the row may
+    // still switch burn ON, but only at the session's own window
+    const s = (sealed ?? {}) as { dials?: unknown; burnAfterOpen?: unknown };
+    const flagKnown = typeof s.dials === 'string' || s.burnAfterOpen !== undefined;
+    return { burn: flagKnown ? !!d.burnAfterOpen : !!row?.burn, secs: Number(d.defaultTtlSeconds) || 0 };
+  }
+  if (row) return { burn: !!row.burn, secs: Number(row.burnSecs) || 0 };
+  return { burn: false, secs: 0 };
 }
 
 /**
@@ -196,6 +332,31 @@ export function parseMediaPayload(text: string): ChatMedia | null {
   return null;
 }
 
+/** b199 group invite delivered inside an encrypted 1:1 chat (owner request,
+ *  Oct 16 2026: add pinned contacts to groups instead of sharing links). The
+ *  link inside carries the group key, so it only ever travels E2E-encrypted;
+ *  the seat it points at is locked to the recipient's Veil ID on the relay. */
+export interface ChatGroupInvite {
+  name: string;
+  link: string;
+  /** the inviter's Veil ID (display only — the join itself is the proof) */
+  from?: string;
+}
+
+export function buildGroupInvitePayload(inv: ChatGroupInvite): string {
+  return JSON.stringify({ __veil_group_invite: 1, name: String(inv.name).slice(0, 40), link: inv.link, ...(inv.from ? { from: inv.from } : {}) });
+}
+
+export function parseGroupInvitePayload(text: string): ChatGroupInvite | null {
+  if (typeof text !== 'string' || !text.startsWith('{"__veil_group_invite":')) return null;
+  try {
+    const t = JSON.parse(text) as Record<string, unknown>;
+    const link = String(t.link ?? '');
+    if (t.__veil_group_invite !== 1 || !/[?&]join=[0-9a-f]+/.test(link) || !/[?&#]w=/.test(link) || !/[?&]g=/.test(link)) return null;
+    return { name: String(t.name ?? 'Group').slice(0, 40) || 'Group', link, ...(t.from ? { from: String(t.from) } : {}) };
+  } catch { return null; }
+}
+
 /** b198 (cutover battery, owner decision): the media cap is 25 MB on BOTH sides —
  * the relay's disk-fill guard and this client cap are ALIGNED (the old mismatch:
  * client allowed 100 MB while the relay 413'd at 12 MB — a confusing failure the
@@ -218,7 +379,7 @@ export async function decryptMedia(bytes: Uint8Array, keyB64: string, ivB64: str
   return new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(ivB64) as unknown as BufferSource }, k, bytes as unknown as BufferSource));
 }
 
-function classifyDecrypted(dec: { text: string; cover: boolean }): 'chat' | 'cover' | 'intro' | 'receipt' | 'media' | 'call' {
+function classifyDecrypted(dec: { text: string; cover: boolean }): 'chat' | 'cover' | 'intro' | 'receipt' | 'media' | 'call' | 'invite' {
   if (dec.cover) return 'cover';
   try {
     const parsed = JSON.parse(dec.text) as Record<string, unknown>;
@@ -226,6 +387,7 @@ function classifyDecrypted(dec: { text: string; cover: boolean }): 'chat' | 'cov
       if (parsed.__veil_intro) return 'intro';
       if (parsed.__veil_receipt) return 'receipt';
       if (parseMediaPayload(dec.text)) return 'media';
+      if (parseGroupInvitePayload(dec.text)) return 'invite';
       if (parsed.__veil_call === 1) return 'call';
     }
   } catch { /* not JSON — a normal chat message */ }
@@ -286,7 +448,8 @@ const notifyLastAt = new Map<string, number>();
  * next sync pass.
  */
 function classifyBurnError(msg: string): 'gone-session' | 'gone-envelope' | 'rate-limited' | 'retry' {
-  if (/session not found/i.test(msg)) return 'gone-session';
+  // Batch F (round-4 review R4-4-07): the exact relay answer only, not a substring
+  if (/^\s*session not found\s*$/i.test(msg)) return 'gone-session';
   if (/entity veilenvelope with id .* not found/i.test(msg)) return 'gone-envelope';
   // b175 (owner Metro repro, Oct 2: rapid-fire burst tripped the relay's
   // own anti-abuse limiter — burn/heartbeat/list all 500'd "Rate limit
@@ -346,6 +509,13 @@ export async function markEnvelopesDisplayed(relay: VeilRelay, sessions: Session
  *  (each sync pass is 1.5-3s while a thread is open, so 20 attempts is
  *  30-60s of retrying, plus it resumes across app restarts). */
 const MAX_BURN_RETRY_ATTEMPTS = 20;
+/** Batch E (F-1): after the fast retries a refused burn is NOT dropped — it is
+ *  retried with backoff (1 min doubling to 1 h) until the relay's own sweep
+ *  backstop (49 h) has certainly removed the envelope. */
+// Batch F (R4-4-12): an envelope can live up to 30 days (the forum dial), not just
+// the 49 h file backstop, so refused burns keep trying for that long
+const BURN_BACKSTOP_MS = 30 * 24 * 3600_000;
+const BURN_BACKOFF_MAX_MS = 3600_000;
 
 export function syncChat(...args: Parameters<typeof syncChatUnlocked>): ReturnType<typeof syncChatUnlocked> {
   // b173: syncs mutate ratchet state (load -> decrypt -> save) exactly like
@@ -368,6 +538,8 @@ export async function syncChatUnlocked(
   knownIds: ReadonlySet<string>,
   burnAfterOpen = false,
   startSkip = 0,
+  /** Batch D (D-09): ignored — the burn window comes from the session's own dials, never the relay row */
+  _burnSecondsHint = 0,
 ): Promise<SyncResult> {
   const sealed = await sessions.load(token);
   if (!sealed) throw new Error('No ratchet state for this session on this device.');
@@ -408,23 +580,36 @@ export async function syncChatUnlocked(
   // The ledger check still runs on every fetched row before decrypt, so
   // ratchet-safety is unchanged; ordering is reversed back to oldest-first
   // so all downstream processing is untouched.
+  // R1 (audit doc 13): the old fixed 3-page cap never reached a backlog
+  // deeper than one pass, and the newest rows must not be decrypted ahead of
+  // older ones (the ratchet keeps only 100 skipped keys per chain). The pager
+  // (backfill.ts) now walks to the processed boundary or the thread's end,
+  // resuming at a persisted row anchor when that takes more than one pass,
+  // and the loop below stops after SYNC_BUDGET definitive outcomes so each
+  // pass still does a bounded amount of decrypt work, oldest-first.
   const SYNC_PAGE = 50;
-  const SYNC_MAX_PAGES = 3;
-  const pages: EnvelopeRecord[][] = [];
-  for (let page = 0; page < SYNC_MAX_PAGES; page++) {
-    const r = await relay.entityList('VeilEnvelope', {
-      session_token: token, sort: '-created_date', limit: SYNC_PAGE,
-      ...(page > 0 ? { skip: page * SYNC_PAGE } : {}),
-    });
-    const pageRows = extractEnvelopes(r);
-    if (!pageRows.length) break;
-    pages.push(pageRows);
-    const oldestId = String(pageRows[pageRows.length - 1]?.id ?? '');
-    // this page's oldest row is already ledger-processed (or the page is
-    // short = the thread's end) — everything above it is merged, stop here
-    if (pageRows.length < SYNC_PAGE || (oldestId && ledger.has(oldestId))) break;
-  }
-  const recs: EnvelopeRecord[] = pages.flat().reverse(); // oldest-first
+  const SYNC_FETCH_PAGES = 10;
+  const SYNC_BUDGET = 150;
+  // test doubles of SessionStore predate the anchor; without it a pass just
+  // starts its descent from the top
+  const anchorStore = sessions as Partial<Pick<SessionStore, 'backfillAnchor' | 'setBackfillAnchor'>>;
+  const priorAnchor = (await anchorStore.backfillAnchor?.(token)) ?? null;
+  const backlog = await pageBacklog({
+    fetchPage: async (skip) => {
+      const r = await relay.entityList('VeilEnvelope', {
+        session_token: token, sort: '-created_date', limit: SYNC_PAGE,
+        ...(skip > 0 ? { skip } : {}),
+      });
+      return extractEnvelopes(r) as Record<string, unknown>[];
+    },
+    isKnown: (id) => ledger.has(id) || strayLedger.has(id) || knownIds.has(id),
+    pageSize: SYNC_PAGE,
+    maxPages: SYNC_FETCH_PAGES,
+    anchor: priorAnchor,
+  });
+  if (backlog.anchor || priorAnchor) await anchorStore.setBackfillAnchor?.(token, backlog.anchor);
+  if (backlog.anchor) console.log(`[veil] sync #${token.slice(0, 4)}: backlog deeper than ${backlog.pages} page(s) — still descending, nothing decrypted this pass`);
+  const recs = backlog.rows as EnvelopeRecord[]; // oldest-first, unprocessed only
   // vestigial cursor: kept for call-site type compat, never advances now
   const nextSkip = startSkip;
   // burn dial lives WITH the sealed ratchet (stored at completion/accept from
@@ -437,6 +622,7 @@ export async function syncChatUnlocked(
   const callSignals: CallSignal[] = [];
   const processedIds: string[] = [];
   const readIds: string[] = [];
+  const reactions: { target: string; emoji: string | null }[] = [];
   let ownSkipped = 0;
   let filtered = 0;
   const sessionGoneRef = { gone: false };
@@ -462,6 +648,7 @@ export async function syncChatUnlocked(
   // queued instead of fired. Hammering 20 more 500s in the same pass is
   // the exact anti-abuse signature that risked the K-4-era 10-minute lock.
   const rateLimitedRef = { hit: false };
+  let burnStuck = 0;
   let pendingBurn = burn ? await sessions.pendingBurns(token) : [];
   if (pendingBurn.length && burn && !burnFlags.callsDisabled) {
     // b197-r8i (K-22 fix): burns pending → AMBIENT TRAFFIC YIELDS. Heartbeats
@@ -470,8 +657,11 @@ export async function syncChatUnlocked(
     // budget, and stayed on the relay. Hold ambient for this pass + a
     // grace window so the burn queue gets the budget first.
     relay.holdAmbientFor(10000);
-    const survivors: { id: string; attempts: number; blob?: string; blobDeleteAt?: number }[] = [];
+    const survivors: { id: string; attempts: number; blob?: string; blobDeleteAt?: number; retryAt?: number; failingSince?: number }[] = [];
     for (const p of pendingBurn) {
+      // Batch E (F-1): a late retry waits for its backoff
+      const late = p as { retryAt?: number };
+      if (late.retryAt && Date.now() < late.retryAt) { burnStuck++; survivors.push(p); continue; }
       // b197-r8m: AWAITING-DISPLAY entries are NOT burned — the human hasn't
       // seen them yet. They wait (the unopened horizon bounds the relay copy);
       // App.tsx flips displayed=true at live render, and the NEXT pass burns.
@@ -504,7 +694,12 @@ export async function syncChatUnlocked(
         // burn dial) so the media stays playable for the whole window; the
         // 49h relay sweep is only the never-opened backstop.
         if (p.blob) {
-          const burnSeconds = Number((sealed as { defaultTtlSeconds?: number }).defaultTtlSeconds) || 300;
+          // b199 (ZTE device run, A3): the file lives exactly as long as the
+          // bubble. The bubble reads the chat's dial (sealed, else the relay
+          // row the caller passes); this used to fall back to a hard 300 s, so
+          // a 60-min chat lost its photo after 5 min while the bubble stayed.
+          // Batch D (D-09): the session's own dial (signed transcript, else sealed) — no relay-row fallback
+          const burnSeconds = sessionDials(sealed)?.defaultTtlSeconds || 7200;
           survivors.push({ id: p.id, attempts: p.attempts, blob: p.blob, blobDeleteAt: Date.now() + burnSeconds * 1000 });
           console.log(`[veil] media blob deletion scheduled at window end (+${burnSeconds}s)`);
         }
@@ -523,11 +718,20 @@ export async function syncChatUnlocked(
           survivors.push(p); // don't burn the retry-attempt budget on a server-side throttle
         } else {
           const attempts = p.attempts + 1;
-          if (attempts >= MAX_BURN_RETRY_ATTEMPTS) {
-            console.error(`[veil] burn retry GIVING UP on ${p.id} after ${attempts} attempts: ${msg} — this envelope will only expire at its ORIGINAL (unshortened) TTL`);
+          const now = Date.now();
+          const failingSince = (p as { failingSince?: number }).failingSince ?? now;
+          if (now - failingSince > BURN_BACKSTOP_MS) {
+            // the relay's sweep has removed the envelope by now (or the relay keeps copies, which no client can stop)
+            console.log(`[veil] burn retry ended for ${p.id}: past the relay's expiry backstop`);
+          } else if (attempts >= MAX_BURN_RETRY_ATTEMPTS) {
+            // Batch E (Superagent round 3, F-1): never give up silently — back off and keep trying
+            const retryAt = now + Math.min(60_000 * 2 ** Math.min(attempts - MAX_BURN_RETRY_ATTEMPTS, 6), BURN_BACKOFF_MAX_MS);
+            console.log(`[veil] burn still refused for ${p.id} (attempt ${attempts}): ${msg} — retrying later`);
+            burnStuck++;
+            survivors.push({ id: p.id, attempts, blob: (p as { blob?: string }).blob, failingSince, retryAt });
           } else {
             console.log(`[veil] burn retry still failing for ${p.id} (attempt ${attempts}/${MAX_BURN_RETRY_ATTEMPTS}): ${msg}`);
-            survivors.push({ id: p.id, attempts, blob: (p as { blob?: string }).blob });
+            survivors.push({ id: p.id, attempts, blob: (p as { blob?: string }).blob, failingSince });
           }
         }
       }
@@ -537,6 +741,9 @@ export async function syncChatUnlocked(
 
   for (const rec of recs) {
     if (sessionGoneRef.gone) break;
+    // R1: per-pass budget counts definitive outcomes only, so rows that stay
+    // retryable can't starve the newer ones behind them
+    if (processedIds.length >= SYNC_BUDGET) break;
     if (!rec.id) continue;
     if (knownIds.has(rec.id) || ledger.has(rec.id) || strayLedger.has(rec.id)) continue;
     // web parity (Zu caller): expired envelopes are skipped client-side
@@ -597,12 +804,26 @@ export async function syncChatUnlocked(
           const msg: ChatMessage = { id: rec.id, text: '', mine: false, ts: relayTimestampToIso(rec.created_date), openedAt: Date.now(), media: parseMediaPayload(dec.text) ?? undefined };
           messages.push(msg);
           cached.push(msg);
+        } else if (kind === 'invite') {
+          // b199: group invitation — rendered as a Join / Decline card
+          console.log(`[veil] envelope ${rec.id}: decrypt OK (n=${n}) — group invite`);
+          const msg: ChatMessage = { id: rec.id, text: '', mine: false, ts: relayTimestampToIso(rec.created_date), openedAt: Date.now(), groupInvite: parseGroupInvitePayload(dec.text) ?? undefined };
+          messages.push(msg);
+          cached.push(msg);
         } else if (kind === 'receipt') {
           // web Wp parser: {"__veil_receipt":1,ids:[...],read:true|false}
           try {
-            const r = JSON.parse(dec.text) as { __veil_receipt?: number; ids?: unknown; read?: boolean };
+            const r = JSON.parse(dec.text) as { __veil_receipt?: number; ids?: unknown; read?: boolean; react?: { t?: unknown; e?: unknown } };
             if (r.__veil_receipt === 1 && Array.isArray(r.ids) && r.read === true) {
               for (const id of r.ids) if (typeof id === 'string') readIds.push(id);
+            }
+            // b199 reactions ride a receipt envelope with no ids, so builds
+            // that predate them treat it as an empty receipt (never as text)
+            if (r.__veil_receipt === 1 && r.react && typeof r.react.t === 'string' && r.react.t) {
+              const e = r.react.e;
+              if (e === null || (typeof e === 'string' && (REACTION_EMOJI as readonly string[]).includes(e))) {
+                reactions.push({ target: r.react.t, emoji: e as string | null });
+              }
             }
           } catch { /* malformed receipt: not fatal, already processed */ }
           filtered++;
@@ -628,7 +849,7 @@ export async function syncChatUnlocked(
         // sees it (App.tsx stamps openedAt at live display and calls
         // markEnvelopeDisplayed). Undisplayed envelopes live to the
         // unopened horizon (the expire dial) — per the owner's two-dial spec.
-        if (burn && !burnFlags.callsDisabled && !sessionGoneRef.gone && (kind === 'chat' || kind === 'media')) {
+        if (burn && !burnFlags.callsDisabled && !sessionGoneRef.gone && (kind === 'chat' || kind === 'media' || kind === 'invite')) {
           // HUMAN-DISPLAY payloads: queue AWAITING-DISPLAY — burns only when
           // the human actually sees it (App.tsx → markEnvelopeDisplayed).
           // b198: media payloads ride their blob: uri — carried on the burn
@@ -715,9 +936,9 @@ export async function syncChatUnlocked(
       }
     } catch (e) {
       // NO silent catches — log the failure WITH reason
-      console.error(`[veil] envelope ${rec.id}: decrypt FAILED — ${(e as Error).message ?? e}; header rp=${rp || '(unparsed)'} expected remote=${(state.remoteRatchetPubJwk ?? '?').slice(0, 16)}...; state n=${state.recvCount} (skipped-key cache holds out-of-order counters, nothing is dropped)`);
+      console.error(`[veil] envelope ${rec.id}: decrypt FAILED — ${(e as Error).message ?? e}; header rp=${rp || '(unparsed)'} expected remote=${(state.remoteRatchetPub ?? '?').slice(0, 16)}...; state n=${state.recvCount} (skipped-key cache holds out-of-order counters, nothing is dropped)`);
       // b91: diagnostics for the stray-vs-desync classification below
-      const rpMismatch = !!rp && !!state.remoteRatchetPubJwk && rp !== state.remoteRatchetPubJwk;
+      const rpMismatch = !!rp && !!state.remoteRatchetPub && rp !== state.remoteRatchetPub;
       failRecs.push({ id: rec.id, ts: rec.created_date ?? null, rpMismatch, order: ++orderCounter });
     }
   }
@@ -735,37 +956,51 @@ export async function syncChatUnlocked(
   if (ownSkipped) console.log(`[veil] sync #${token.slice(0, 4)}: skipped ${ownSkipped} own envelope(s) (header rp in myPubs)`);
   if (filtered) console.log(`[veil] sync #${token.slice(0, 4)}: filtered ${filtered} non-chat envelope(s) (cover/intro/receipt)`);
   const next = withExtras(await serializeRatchetState(state), sealed);
+  // Batch F (round-4 review R4-1-02): a burn or fetch answer alone doesn't wipe a
+  // chat. Ask the relay about THIS session (the same check as the open-chat
+  // path); only a definite "Session not found" removes keys and history.
+  if (sessionGoneRef.gone && (await relaySessionLiveness(relay, token, sealed.writeSecret ?? null)) !== 'gone') {
+    console.log(`[veil] sync #${token.slice(0, 4)}: a relay answer said the session is gone, but the session check says otherwise — keeping it`);
+    sessionGoneRef.gone = false;
+  }
   if (sessionGoneRef.gone) {
     // b80: the relay confirmed this session no longer exists — remove ALL
     // local residue (state, wrapper, msgcache, ledger) instead of re-saving
     // it, so the next poll finds nothing and stops for good.
     console.log(`[veil] sync #${token.slice(0, 4)}: session confirmed deleted server-side — clearing local state, will not sync again`);
     await sessions.remove(token);
-    return { messages, processedIds, readIds, state: next, ended: true, nextSkip, strayIds: [], desync: false, callSignals, rateLimited: rateLimitedRef.hit };
+    return { messages, processedIds, readIds, reactions, state: next, ended: true, nextSkip, strayIds: [], desync: false, callSignals, rateLimited: rateLimitedRef.hit };
   }
-  if (processedIds.length) {
-    // b78: persist BEFORE anything else — if the ledger misses an id, the
-    // next poll re-decrypts a consumed envelope and poisons the ratchet.
+  // Batch H (round-6 review R6-1-06): the ratchet is saved FIRST and the ids are
+  // marked only once it landed. (Marking first meant a refused ratchet save made
+  // the next pass skip envelopes whose advance was never stored.) A refused save
+  // keeps reading working — this pass's messages are shown — and is reported.
+  let stateSaved = true;
+  if (cached.length || processedIds.length) {
+    stateSaved = (await sessions.save(token, next).catch(() => false)) !== false;
+    if (!stateSaved) console.log(`[veil] sync #${token.slice(0, 4)}: the chat state was not saved (storage refused) — kept for this pass only`);
+  }
+  if (processedIds.length && stateSaved) {
     await sessions.markProcessedIds(token, processedIds);
   }
   // b102: persist the pending-burn queue every pass — new failures queued
   // this pass, retries resolved this pass (removed), and attempt counts for
   // ones still failing. Runs even when unchanged (cheap) so a queue that
   // drains to empty is reliably cleared from storage.
+  // Batch H (R5-1-09): a refused write or a full queue is reported
+  let burnQueueTrouble = false;
   if (burn) {
-    await sessions.setPendingBurns(token, pendingBurn);
+    const bq = await sessions.setPendingBurns(token, pendingBurn) as { saved: boolean; full: boolean } | undefined;
+    burnQueueTrouble = !!bq && (!bq.saved || bq.full);
   }
-  if (cached.length || processedIds.length) {
-    await sessions.save(token, next);
-    if (cached.length) await sessions.cacheMessages(token, cached);
-  }
+  if (cached.length) await sessions.cacheMessages(token, cached);
   if (strayIds.length) {
     console.log(`[veil] sync #${token.slice(0, 4)}: ${strayIds.length} stray envelope(s) failed to decrypt but newer messages arrived fine — classified as strays, not a desync`);
   }
   if (desync) {
     console.error(`[veil] sync #${token.slice(0, 4)}: ${(failRecs.length - strayIds.length)} decrypt failure(s) show genuine desync signatures (key mismatch or stacking) — recommending end + new session`);
   }
-  return { messages, processedIds, readIds, state: next, nextSkip, strayIds, desync, callSignals, rateLimited: rateLimitedRef.hit };
+  return { messages, processedIds, readIds, reactions, state: next, nextSkip, strayIds, desync, callSignals, rateLimited: rateLimitedRef.hit, ...(burnStuck ? { burnStuck } : {}), ...(stateSaved ? {} : { stateNotSaved: true }), ...(burnQueueTrouble ? { burnQueueTrouble: true } : {}) };
 }
 
 /**
@@ -777,7 +1012,9 @@ export async function syncChatUnlocked(
  * uniform-envelope claim and the UI's "expire N hours after sending" text.
  */
 export function envelopeTtlSeconds(sealed: object): number {
-  const raw = (sealed ?? {}) as { expireAfterSeconds?: number };
+  // Batch D (D-09): the signed transcript dials first (see sessionDials)
+  const d = sessionDials(sealed);
+  const raw = (d ?? sealed ?? {}) as { expireAfterSeconds?: number };
   // b92 F-S7 (settings sweep): EXPLICIT Off (0) is a chosen dial, not a
   // missing one — web Kh semantics give it the relay's 36 h hard cap, not a
   // silent 24 h expiry that contradicts the "Off" choice. A MISSING/invalid
@@ -820,6 +1057,10 @@ async function sendChatMessageUnlocked(
   let lastEnvId = '';
   for (let i = 0; i < chunks.length; i++) {
     const env = await encryptMessage(state, chunks[i]);
+    // Batch H (round-6 review R6-1-06): persist BEFORE send. A refused save stops
+    // here, so a step can never be sent twice; a send that then fails leaves a
+    // one-step gap, which the peer's skipped-key window absorbs.
+    await saveOrThrow(sessions, token, withExtras(await serializeRatchetState(state), sealed));
     const r = await relay.submitEnvelope({
       session_token: token,
       client_id: clientId,
@@ -830,20 +1071,21 @@ async function sendChatMessageUnlocked(
       header: env.header,
       byte_length: env.byteLength ?? env.ciphertext.length,
       ttl_seconds: ttl,
-      protocolVersion: sealed.proto ?? 'veil-ratchet-4',
+      protocolVersion: sealed.proto ?? 'veil-ratchet-6',
     });
     assertSubmitOk(r, 'message submit'); // b127: HTTP-200-wrapped rejects were silent
-    // save per chunk — a mid-split failure must leave persisted state exactly
-    // consistent with what actually reached the relay (b188-r5 principle).
-    const next = withExtras(await serializeRatchetState(state), sealed);
-    await sessions.save(token, next);
+    // (saved per chunk, before each chunk went out — Batch H)
     lastEnvId = submitResponseId(r.data) ?? '';
   }
   // b198 (two-dial burn): own bubbles get NO burn clock at send — the clock
   // starts when the PEER's read receipt lands (see markCachedRead/App receipt
   // paths), matching the relay copy's burn-at-recipient-open. Pre-receipt the
   // row is treated as never-displayed: no countdown, no local purge.
-  const msg: ChatMessage = { id, text, mine: true, ts: new Date().toISOString(), envId: lastEnvId };
+  // b199: a sent group invite renders as the same card on my side (never raw JSON)
+  const sentInvite = parseGroupInvitePayload(text);
+  const msg: ChatMessage = sentInvite
+    ? { id, text: '', mine: true, ts: new Date().toISOString(), envId: lastEnvId, groupInvite: sentInvite }
+    : { id, text, mine: true, ts: new Date().toISOString(), envId: lastEnvId };
   await sessions.cacheMessages(token, [msg]);
   // b85: real text message — fire the lock-screen alert push
   void notifySent(relay, token, sealed.writeSecret);
@@ -879,6 +1121,10 @@ async function sendCoverEnvelopeUnlocked(
   const bytes = crypto.getRandomValues(new Uint8Array(1536));
   const filler = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
   const env = await encryptMessage(state, filler, { cover: true });
+  // Batch H (round-6 review R6-1-06): persist BEFORE send. A refused save stops
+  // here, so a step can never be sent twice; a send that then fails leaves a
+  // one-step gap, which the peer's skipped-key window absorbs.
+  await saveOrThrow(sessions, token, withExtras(await serializeRatchetState(state), sealed));
   const r = await relay.submitEnvelope({
     session_token: token,
     client_id: clientId,
@@ -889,11 +1135,9 @@ async function sendCoverEnvelopeUnlocked(
     header: env.header,
     byte_length: env.byteLength ?? env.ciphertext.length,
     ttl_seconds: ttl,
-    protocolVersion: sealed.proto ?? 'veil-ratchet-4',
+    protocolVersion: sealed.proto ?? 'veil-ratchet-6',
   });
   assertSubmitOk(r, 'cover submit'); // b127: silent-reject parity with messages/receipts
-  const next = withExtras(await serializeRatchetState(state), sealed);
-  await sessions.save(token, next);
   return true;
 }
 
@@ -906,6 +1150,46 @@ async function sendCoverEnvelopeUnlocked(
  * receipts flow for delivery state even with receipts off (web parity:
  * c ? {__veil_receipt:1,ids:r,read:true} : {__veil_receipt:1,ids:r}).
  */
+/**
+ * b199 REACTION (owner request, Oct 17): set or clear MY reaction on one
+ * message, ratchet-encrypted like everything else. Shape:
+ *   {"__veil_receipt":1,"ids":[],"react":{"t":<envelope id>,"e":<emoji|null>}}
+ * Riding the receipt shape is deliberate: older builds parse it as an empty
+ * receipt and drop it, instead of showing the JSON as a chat message. The
+ * relay sees one more ordinary encrypted envelope, as with any receipt.
+ */
+export function sendReaction(
+  relay: VeilRelay, sessions: SessionStore, token: string, clientId: string, target: string, emoji: string | null,
+): Promise<void> {
+  if (emoji !== null && !(REACTION_EMOJI as readonly string[]).includes(emoji)) return Promise.reject(new Error('Unsupported reaction'));
+  return serializeRatchetSend(token, async () => {
+    const sealed = await sessions.load(token);
+    if (!sealed) throw new Error('No ratchet state for this session on this device.');
+    const state = await deserializeRatchetState(sealed);
+    const env = await encryptMessage(state, JSON.stringify({ __veil_receipt: 1, ids: [], react: { t: target, e: emoji } }));
+    // Batch H (round-6 review R6-1-06): persist BEFORE send. A refused save stops
+    // here, so a step can never be sent twice; a send that then fails leaves a
+    // one-step gap, which the peer's skipped-key window absorbs.
+    await saveOrThrow(sessions, token, withExtras(await serializeRatchetState(state), sealed));
+    const r = await relay.submitEnvelope({
+      session_token: token,
+      client_id: clientId,
+      write_secret: sealed.writeSecret,
+      sender_client_id: await senderPseudonym(env.header),
+      ciphertext: env.ciphertext,
+      iv: env.iv,
+      header: env.header,
+      byte_length: env.byteLength ?? env.ciphertext.length,
+      ttl_seconds: envelopeTtlSeconds(sealed),
+      protocolVersion: sealed.proto ?? 'veil-ratchet-6',
+    });
+    assertSubmitOk(r, 'reaction submit');
+    // b199 (owner, Oct 17 device run): a new reaction alerts the peer like a
+    // message does (same content-free push); clearing one stays silent.
+    if (emoji !== null) void notifySent(relay, token, sealed.writeSecret);
+  });
+}
+
 export function sendReadReceipt(...args: Parameters<typeof sendReadReceiptUnlocked>): ReturnType<typeof sendReadReceiptUnlocked> {
   // b147: ratchet writes serialize per token — a concurrent burst must not
   // encrypt the same step twice (see send-queue.ts).
@@ -945,6 +1229,10 @@ async function sendReadReceiptUnlocked(
     const chunk = ids.slice(i, i + 20);
     const body = JSON.stringify({ __veil_receipt: 1, ids: chunk, ...(read ? { read: true } : {}) });
     const env = await encryptMessage(state, body);
+    // Batch H (round-6 review R6-1-06): persist BEFORE send. A refused save stops
+    // here, so a step can never be sent twice; a send that then fails leaves a
+    // one-step gap, which the peer's skipped-key window absorbs.
+    await saveOrThrow(sessions, token, withExtras(await serializeRatchetState(state), sealed));
     const r = await relay.submitEnvelope({
       session_token: token,
       client_id: clientId,
@@ -955,17 +1243,13 @@ async function sendReadReceiptUnlocked(
       header: env.header,
       byte_length: env.byteLength ?? env.ciphertext.length,
       ttl_seconds: ttl,
-      protocolVersion: sealed.proto ?? 'veil-ratchet-4',
+      protocolVersion: sealed.proto ?? 'veil-ratchet-6',
     });
     assertSubmitOk(r, 'receipt submit'); // b127: owner repro — receipts vanished silently
 
-    // b177: persist the ratchet advance after EACH chunk, not once at the
-    // end — if a LATER chunk fails (e.g. mid-batch rate-limit), the
-    // chunks that already landed on the relay must not be left desynced
-    // from local state (which would re-derive the wrong send-chain step
-    // on the next call and break decryption on the peer's side).
-    const next = withExtras(await serializeRatchetState(state), sealed);
-    await sessions.save(token, next);
+    // b177: the ratchet advance is persisted per chunk (since Batch H, before
+    // each chunk goes out), so a LATER failing chunk never leaves the ones that
+    // landed out of step with local state.
   }
 }
 
@@ -1023,6 +1307,10 @@ async function sendMediaMessageUnlocked(
   const body = JSON.stringify({ __veil_media: 1, uri: fileUri, k: keyB64, iv: ivB64, ...f });
 
   const env = await encryptMessage(state, body);
+  // Batch H (round-6 review R6-1-06): persist BEFORE send. A refused save stops
+  // here, so a step can never be sent twice; a send that then fails leaves a
+  // one-step gap, which the peer's skipped-key window absorbs.
+  await saveOrThrow(sessions, token, withExtras(await serializeRatchetState(state), sealed));
   const id = `local_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
   const r = await relay.submitEnvelope({
     session_token: token,
@@ -1035,11 +1323,10 @@ async function sendMediaMessageUnlocked(
     byte_length: env.byteLength ?? env.ciphertext.length,
     ttl_seconds: ttl,
     media_uri: fileUri,
-    protocolVersion: sealed.proto ?? 'veil-ratchet-4',
+    protocolVersion: sealed.proto ?? 'veil-ratchet-6',
   });
-
-  const next = withExtras(await serializeRatchetState(state), sealed);
-  await sessions.save(token, next);
+  // Batch H (round-5 review R4-4-32, dropped in Batch G): a rejected media send is not "sent"
+  assertSubmitOk(r, 'media submit');
   // b198 two-dial: own media bubbles have no burn clock until the peer's receipt
   const msg: ChatMessage = {
     id, text: '', mine: true, ts: new Date().toISOString(), envId: submitResponseId(r.data),
@@ -1087,7 +1374,18 @@ export async function loadMediaFile(
  * carries responder_* keys), derive the sending chains and reseal. No-op when
  * already ready. Throws when the peer has not joined yet (composer gate).
  */
-export async function completeContactHandshake(
+/** Batch H (round-5 review R5-1-07, second half): completion runs under the
+ *  session's send lock, so a send or sync in flight can't write over it. */
+export function completeContactHandshake(
+  relay: VeilRelay,
+  sessions: SessionStore,
+  token: string,
+  prefetched?: Record<string, unknown>,
+): Promise<void> {
+  return serializeRatchetSend(token, () => completeContactHandshakeUnlocked(relay, sessions, token, prefetched));
+}
+
+async function completeContactHandshakeUnlocked(
   relay: VeilRelay,
   sessions: SessionStore,
   token: string,
@@ -1111,12 +1409,17 @@ export async function completeContactHandshake(
     rec.responder_pub_jwk, rec.responder_ratchet_pub_jwk, rec.responder_pq_ct || null,
   );
   // keep the session's dials with the ratchet so sync can burn and sends
-  // derive the same per-message TTL (web Kh semantics)
-  await sessions.save(token, {
+  // derive the same per-message TTL (web Kh semantics).
+  // Batch C (V-12): the initiator keeps its OWN dials (sealed at create and
+  // bound into the fingerprint) — never the relay row's copy.
+  const own = sealed as { burnAfterOpen?: boolean; defaultTtlSeconds?: number; expireAfterSeconds?: number; peerVeilId?: string; peerIkPub?: string; myVerifiedFp?: string };
+  await saveOrThrow(sessions, token, { // Batch H (R6-1-06)
     ...(await serializeRatchetState(state)),
-    burnAfterOpen: !!rec.burn_after_open,
-    defaultTtlSeconds: Number(rec.default_ttl_seconds) || 7200,
-    expireAfterSeconds: Number(rec.expire_after_seconds) || 86400,
+    ...(own.peerVeilId && own.peerIkPub ? { peerVeilId: own.peerVeilId, peerIkPub: own.peerIkPub } : {}), // Batch F (R4-1-04)
+    ...(own.myVerifiedFp ? { myVerifiedFp: own.myVerifiedFp } : {}), // Batch F (R4-1-03)
+    burnAfterOpen: own.burnAfterOpen === true,
+    defaultTtlSeconds: Number.isFinite(Number(own.defaultTtlSeconds)) ? Number(own.defaultTtlSeconds) : 7200,
+    expireAfterSeconds: Number.isFinite(Number(own.expireAfterSeconds)) ? Number(own.expireAfterSeconds) : 86400,
   } as never);
 }
 

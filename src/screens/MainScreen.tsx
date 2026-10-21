@@ -1,9 +1,12 @@
 import React from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, Image } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, Image, Keyboard } from 'react-native';
+import { useKbPadding } from '../hooks/useKbPadding';
+import { PASSWORD_MAX } from '../password';
 import { useThemedShare } from './ThemedSheets';
+import { VeilQrSheet } from './VeilQr';
 import { Ionicons } from '@expo/vector-icons';
 import { SessionsScreen, type SessionRow } from './SessionsScreen';
-import { ContactsScreen, type ContactRow, type LookupResult } from './ContactsScreen';
+import { ContactsScreen, type ContactRow, type LookupResult, type GroupInviteResult, type ContactChatChoice } from './ContactsScreen';
 import { SettingsScreen } from './SettingsScreen';
 import { VaultsScreen, NotesScreen, StegoScreen } from './ToolsScreen';
 import type { VeilApp } from '../veil-app';
@@ -30,8 +33,18 @@ export interface MainScreenProps {
   onMessage: (veilId: string) => void;
   onVerify: (veilId: string) => Promise<void>;
   onSetNickname: (veilId: string, nickname: string) => void;
-  /** b62 groups: create a group + invite links (creator flow) */
-  onCreateGroup: (name: string, inviteCount: number) => Promise<{ groupName: string; inviteLinks: string[] }>;
+  /** b199 groups: create with pinned contacts (+ optional backup links) */
+  onCreateGroup: (name: string, invitees: string[], linkCount: number) => Promise<GroupInviteResult>;
+  /** b199: open your existing chat with a contact; never starts one silently */
+  onOpenContact: (veilId: string, choice?: { open?: string; start?: boolean }) => Promise<ContactChatChoice[] | null>;
+  /** b199: groups created on this phone + "Add people" */
+  myGroups: { groupToken: string; name: string }[];
+  onAddGroupPeople: (groupToken: string, invitees: string[], linkCount: number) => Promise<GroupInviteResult>;
+  /** b199 Veil QR: add link opened — Contacts looks it up and asks to confirm */
+  prefillAdd?: { veilId: string; nonce: number } | null;
+  /** Play UGC: device-local block list (Settings > Blocked) */
+  blockedIds?: string[];
+  onUnblock?: (veilId: string) => Promise<void>;
   settings: VeilSettings;
   onSettingsChange: (s: VeilSettings) => void;
   onRunCheckup: () => void;
@@ -46,6 +59,7 @@ export interface MainScreenProps {
   onCreateTransfer: () => Promise<{ link: string; sessionCount: number; groupCount: number; hasIdentity: boolean }>;
   onReceiveTransfer: (link: string) => Promise<{ sessionCount: number; importedCount: number; skippedExisting: number; identityImported: boolean; identityKept: boolean }>;
   onVerifyPhrase: (phrase: string) => Promise<boolean>;
+  onSwitchToPhraseSignIn?: (phrase: string) => Promise<'ok' | 'wrong-phrase'>;
   onRemoveIdentity: () => Promise<void>;
   onGenerateNewVeilId: () => Promise<void>;
   onCreateIdentity: () => void;
@@ -72,10 +86,11 @@ export interface MainScreenProps {
 export function MainScreen({
   app, decoyMode, veilId, email, busy, onSignOut,
   sessions, onRefreshSessions, onOpenSession, onNewSession, onCreateInvite, onJoinInvite,
-  contacts, contactsError, onLookup, onPin, onUnpin, onMessage, onVerify, onSetNickname, onCreateGroup, settings, onSettingsChange, onRunCheckup, tab, onTab,
+  contacts, contactsError, onLookup, onPin, onUnpin, onMessage, onVerify, onSetNickname, onCreateGroup, onOpenContact, myGroups, onAddGroupPeople, prefillAdd, settings, onSettingsChange, onRunCheckup, tab, onTab,
+  blockedIds, onUnblock,
   appLockEnabled, onSetAppLock, onRemoveAppLock,
   onLockNow, onWipeDevice, onDeleteAccount, onViewIntro, webBaseUrl,
-  onCreateTransfer, onReceiveTransfer, onVerifyPhrase, onRemoveIdentity, onGenerateNewVeilId, onCreateIdentity,
+  onCreateTransfer, onReceiveTransfer, onVerifyPhrase, onSwitchToPhraseSignIn, onRemoveIdentity, onGenerateNewVeilId, onCreateIdentity,
   securePrompt, onDismissSecurePrompt, welcomeVisible, onOpenWelcome,
   forumBannerVisible, forumBannerBusy, onJoinForum, onDismissForumBanner,
 }: MainScreenProps) {
@@ -87,6 +102,11 @@ export function MainScreen({
   const [notesCode, setNotesCode] = React.useState('');
   const [notesErr, setNotesErr] = React.useState<string | null>(null);
   const [notesBusy, setNotesBusy] = React.useState(false);
+  // b199: keyboard height for the Notes lock (the tab bar under it is ~58pt tall)
+  const kbRaw = useKbPadding();
+  const notesKb = Math.max(0, kbRaw - 58);
+  // b199: full-screen VEIL QR (opened from the identity card)
+  const [qrOpen, setQrOpen] = React.useState(false);
   React.useEffect(() => { if (tab === 'notes') { setNotesUnlocked(false); setNotesCode(''); setNotesErr(null); } }, [tab]);
   const unlockNotes = async () => {
     if (notesBusy || !notesCode) return;
@@ -94,15 +114,19 @@ export function MainScreen({
     try {
       const kind = await app.appLock.verify(notesCode);
       if (kind === 'real') { setNotesUnlocked(true); setNotesErr(null); setNotesCode(''); }
-      else { setNotesErr('Wrong passcode.'); setNotesCode(''); }
-    } catch { setNotesErr('Could not verify — try again.'); }
+      else { setNotesErr('Wrong password.'); setNotesCode(''); }
+    } catch (e) {
+      // Batch D (D-11): verify enforces the shared lockout here too
+      const m = String((e as Error)?.message ?? '');
+      setNotesErr(/too many|could not be read/i.test(m) ? m : 'Could not verify — try again.');
+    }
     finally { setNotesBusy(false); }
   };
   // b105: VEIL-branded share card for the Veil ID (owner request Sept 22 —
   // the identity strip jumped straight into Apple's stock share sheet)
   const { node: shareNode, share: openShare } = useThemedShare();
   const tabIcon = (name: keyof typeof Ionicons.glyphMap, active: boolean) => (
-    <Ionicons name={name} size={21} color={active ? '#7cf4c8' : '#4a5b66'} />
+    <Ionicons name={name} size={21} color={active ? '#FFFFFF' : '#5E6464'} />
   );
   // b90: total unread across threads — highlights the Chat tab icon
   const unreadTotal = sessions.reduce((n, r) => n + (r.unread || 0), 0);
@@ -113,29 +137,19 @@ export function MainScreen({
       <View style={styles.header}>
         <View style={styles.brandRow}>
           <Image source={require('../../assets/logo.png')} style={styles.logoSmall} />
-          <Text style={styles.logo}>VEIL</Text>
+          <Text style={styles.logo}><Text style={{ color: '#20D9C2' }}>V</Text>ardum</Text>
         </View>
         <TouchableOpacity onPress={onSignOut} disabled={busy}>
           <Text style={styles.signOut}>{busy ? '…' : 'Sign out'}</Text>
         </TouchableOpacity>
       </View>
 
-      <TouchableOpacity
-        style={styles.identityStrip}
-        disabled={!veilId}
-        activeOpacity={0.6}
-        onPress={() => { if (veilId) openShare({ value: veilId, kicker: 'Keys sealed in the device keychain — people use it to look you up.' }); }}
-      >
-        <View style={styles.veilIdRow}>
-          {veilId ? <View style={styles.idDot} /> : null}
-          <Text style={styles.veilId} numberOfLines={1}>{veilId ?? 'no identity on this device'}</Text>
-        </View>
-        {veilId ? <Text style={styles.ok}>Keys sealed in the device keychain · tap to share your Veil ID</Text> : null}
-      </TouchableOpacity>
+      {/* b199 (owner, Oct 16): the Veil ID strip that sat on every tab is gone —
+          the identity card now lives at the top of Conversations (and Settings). */}
 
       {securePrompt ? (
         <View style={styles.secureBox}>
-          <Text style={styles.secureTitle}>Secure your VEIL</Text>
+          <Text style={styles.secureTitle}>Lock down this phone</Text>
           <Text style={styles.secureTxt}>Run the privacy checkup and set an app lock. Nothing is pre-set — every control is yours.</Text>
           <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}>
             <TouchableOpacity style={styles.secureBtn} onPress={onRunCheckup}>
@@ -150,25 +164,58 @@ export function MainScreen({
 
       <View style={styles.body}>
         {tab === 'sessions' ? (
-          <SessionsScreen sessions={sessions} busy={busy} onRefresh={onRefreshSessions} onOpenSession={onOpenSession} onNewSession={onNewSession} onCreateInvite={onCreateInvite} onJoinInvite={onJoinInvite} welcomeVisible={welcomeVisible} onOpenWelcome={onOpenWelcome} forumBannerVisible={forumBannerVisible} forumBannerBusy={forumBannerBusy} onJoinForum={onJoinForum} onDismissForumBanner={onDismissForumBanner} />
+          <SessionsScreen sessions={sessions} busy={busy} onRefresh={onRefreshSessions} onOpenSession={onOpenSession} onNewSession={onNewSession} onCreateInvite={onCreateInvite} onJoinInvite={onJoinInvite} welcomeVisible={welcomeVisible} onOpenWelcome={onOpenWelcome} forumBannerVisible={forumBannerVisible} forumBannerBusy={forumBannerBusy} onJoinForum={onJoinForum} onDismissForumBanner={onDismissForumBanner} identity={{ veilId: veilId ?? null, nickname: settings.nickname, onShare: () => { if (veilId) openShare({ value: veilId, kicker: 'People use it to look you up and start verified conversations.' }); }, onShowQr: () => setQrOpen(true) }} />
         ) : tab === 'contacts' ? (
-          <ContactsScreen contacts={contacts} busy={busy} error={contactsError} onLookup={onLookup} onPin={onPin} onUnpin={onUnpin} onMessage={onMessage} onVerify={onVerify} onSetNickname={onSetNickname} onCreateGroup={onCreateGroup} />
+          <ContactsScreen contacts={contacts} busy={busy} error={contactsError} onLookup={onLookup} onPin={onPin} onUnpin={onUnpin} onMessage={onMessage} onVerify={onVerify} onSetNickname={onSetNickname} onCreateGroup={onCreateGroup} onOpenContact={onOpenContact} myGroups={myGroups} onAddGroupPeople={onAddGroupPeople} prefillAdd={prefillAdd} />
         ) : tab === 'vaults' ? (
           <VaultsScreen app={app} decoy={decoyMode} veilId={veilId} />
         ) : tab === 'notes' ? (
+          // b199 UI redesign (owner, Oct 16: "the gate is very plain"): same
+          // look as the app lock screen — lock mark, passcode dots, keypad.
           !appLockEnabled ? (
             <View style={styles.notesGate}>
+              <View style={styles.notesGateIcon}><Ionicons name="lock-closed" size={30} color="#FFFFFF" /></View>
               <Text style={styles.notesGateTitle}>Notes are locked</Text>
-              <Text style={styles.notesGateBody}>Notes open only behind the app passcode. Set one in Settings → App Lock, then come back.</Text>
+              <Text style={styles.notesGateBody}>Notes open only behind the app password. Set one in Settings → App lock, then come back.</Text>
               <TouchableOpacity style={styles.notesGateBtn} onPress={() => onTab('settings')}><Text style={styles.notesGateBtnTxt}>Go to Settings</Text></TouchableOpacity>
             </View>
           ) : !notesUnlocked ? (
-            <View style={styles.notesGate}>
-              <Text style={styles.notesGateTitle}>Notes are locked</Text>
-              <Text style={styles.notesGateBody}>Enter your app passcode to open Notes.</Text>
-              <TextInput style={styles.notesGateInput} secureTextEntry keyboardType="number-pad" maxLength={12} value={notesCode} onChangeText={setNotesCode} onSubmitEditing={unlockNotes} placeholder="••••" placeholderTextColor="#3b4b56" />
-              {notesErr ? <Text style={styles.notesGateErr}>{notesErr}</Text> : null}
-              <TouchableOpacity style={styles.notesGateBtn} disabled={notesBusy} onPress={unlockNotes}><Text style={styles.notesGateBtnTxt}>{notesBusy ? 'Checking…' : 'Unlock Notes'}</Text></TouchableOpacity>
+            // b199 (owner, Oct 16): big lock mark + words; the slim bar at the
+            // bottom IS the password field — tapping it opens the dark iPhone
+            // keyboard (any characters, up to 50; AutoFill and saving are off).
+            <View style={[styles.notesGateFull, notesKb > 0 ? { paddingBottom: notesKb } : null]}>
+              <TouchableOpacity style={styles.notesGateTop} activeOpacity={1} onPress={() => Keyboard.dismiss()}>
+                <View style={[styles.notesGateIconBig, notesKb > 0 && styles.notesGateIconSmall]}><Ionicons name="document-lock-outline" size={notesKb > 0 ? 30 : 46} color="#FFFFFF" /></View>
+                <Text style={styles.notesGateTitleBig}>Notes are locked</Text>
+                <Text style={styles.notesGateBodyBig}>Enter your app password to open Notes.</Text>
+              </TouchableOpacity>
+              <Text style={styles.notesGateErr}>{notesBusy ? 'Checking…' : (notesErr ?? '')}</Text>
+              <View style={[styles.notesBar, notesCode.length > 0 && styles.notesBarOn]}>
+                <Ionicons name="lock-closed-outline" size={18} color={notesCode.length > 0 ? '#FFFFFF' : '#8E9696'} />
+                <TextInput
+                  style={styles.notesBarInput}
+                  value={notesCode}
+                  onChangeText={(t) => { setNotesErr(null); setNotesCode(t.slice(0, PASSWORD_MAX)); }}
+                  onSubmitEditing={unlockNotes}
+                  editable={!notesBusy}
+                  secureTextEntry
+                  maxLength={PASSWORD_MAX}
+                  placeholder="Enter password"
+                  placeholderTextColor="#5E6464"
+                  keyboardAppearance="dark"
+                  returnKeyType="go"
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  spellCheck={false}
+                  textContentType="oneTimeCode" // suppresses iOS Use Strong Password
+                  autoComplete="off"
+                  importantForAutofill="no"
+                  accessibilityLabel="Password"
+                />
+              </View>
+              <TouchableOpacity style={[styles.notesGateBtn, styles.notesGateBtnBar, (notesBusy || !notesCode) && styles.notesGateBtnOff]} disabled={notesBusy || !notesCode} onPress={unlockNotes}>
+                <Text style={styles.notesGateBtnTxt}>{notesBusy ? 'Checking…' : 'Unlock Notes'}</Text>
+              </TouchableOpacity>
             </View>
           ) : (
             <NotesScreen app={app} decoy={decoyMode} veilId={veilId} />
@@ -184,8 +231,9 @@ export function MainScreen({
             onDeleteAccount={onDeleteAccount} onViewIntro={onViewIntro} onOpenWelcome={onOpenWelcome} webBaseUrl={webBaseUrl}
             onOpenTools={() => onTab('vaults')} onOpenContacts={() => onTab('contacts')}
             onCreateTransfer={onCreateTransfer} onReceiveTransfer={onReceiveTransfer}
-            onVerifyPhrase={onVerifyPhrase} onRemoveIdentity={onRemoveIdentity}
-            onGenerateNewVeilId={onGenerateNewVeilId} onCreateIdentity={onCreateIdentity}
+            onVerifyPhrase={onVerifyPhrase} onSwitchToPhraseSignIn={onSwitchToPhraseSignIn} onRemoveIdentity={onRemoveIdentity}
+            onGenerateNewVeilId={onGenerateNewVeilId} onCreateIdentity={onCreateIdentity} onShowQr={() => setQrOpen(true)}
+            blockedIds={blockedIds} onUnblock={onUnblock}
           />
         )}
       </View>
@@ -223,38 +271,70 @@ export function MainScreen({
           <Text style={[styles.bottomLabel, tab === 'settings' && styles.bottomLabelOn]}>Settings</Text>
         </TouchableOpacity>
       </View>
+      {qrOpen && veilId ? (
+        <VeilQrSheet
+          veilId={veilId}
+          nickname={settings.nickname}
+          onClose={() => setQrOpen(false)}
+          onShareLink={(link) => { setQrOpen(false); openShare({ value: link, kicker: 'Send this to someone so they can add you on Vardum. It holds only your Vardum ID.' }); }}
+        />
+      ) : null}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   // b198 Notes gate — the passcode prompt covering the Notes tab
-  notesGate: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 32, backgroundColor: '#0b141a' },
-  notesGateTitle: { fontSize: 20, fontWeight: '700', color: '#e8f1f2', marginBottom: 10 },
-  notesGateBody: { fontSize: 14, color: '#8ba1ad', textAlign: 'center', marginBottom: 22, lineHeight: 20 },
-  notesGateInput: { width: 180, padding: 12, borderRadius: 10, backgroundColor: '#14212b', color: '#e8f1f2', textAlign: 'center', fontSize: 18, letterSpacing: 6, marginBottom: 12 },
-  notesGateBtn: { paddingVertical: 12, paddingHorizontal: 28, borderRadius: 10, backgroundColor: '#123f36' },
-  notesGateBtnTxt: { color: '#7cf4c8', fontWeight: '700' },
-  notesGateErr: { color: '#ff8a8a', marginBottom: 12 },
-  secureBox: { borderWidth: 1, borderColor: '#7cf4c8', borderRadius: 10, padding: 12, marginHorizontal: 14, marginTop: 8, marginBottom: 4, backgroundColor: 'rgba(124,244,200,0.04)' },
-  secureTitle: { color: '#7cf4c8', fontSize: 13, fontWeight: '800', marginBottom: 4 },
-  secureTxt: { color: '#7a8b96', fontSize: 11, lineHeight: 15 },
-  secureBtn: { backgroundColor: '#7cf4c8', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8 },
-  secureBtnTxt: { color: '#06231c', fontWeight: '800', fontSize: 12 },
-  secureBtnGhost: { borderWidth: 1, borderColor: '#2a3b46', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8 },
-  secureBtnGhostTxt: { color: '#7a8b96', fontSize: 12 },
-  fill: { flex: 1, backgroundColor: '#0b0f14' },
+  notesGate: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 24, paddingVertical: 12, backgroundColor: '#0B0B0F' },
+  notesGateIcon: { width: 68, height: 68, borderRadius: 34, borderWidth: 1, borderColor: '#3A3A44', backgroundColor: 'rgba(255,255,255,0.08)', alignItems: 'center', justifyContent: 'center', marginBottom: 14 },
+  notesGateTitle: { fontSize: 19, fontWeight: '700', color: '#FFFFFF', marginBottom: 6 },
+  notesGateBody: { fontSize: 13, color: '#8E9696', textAlign: 'center', marginBottom: 16, lineHeight: 19 },
+  notesDots: { flexDirection: 'row', gap: 12, marginBottom: 4 },
+  notesDot: { width: 13, height: 13, borderRadius: 7, borderWidth: 1, borderColor: '#3A3A44' },
+  notesDotOn: { backgroundColor: '#FFFFFF', borderColor: '#FFFFFF' },
+  notesGateErr: { color: '#e8836f', fontSize: 13, height: 20, textAlign: 'center', marginBottom: 4 },
+  notesPad: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', width: 240, marginBottom: 10 },
+  notesKey: { width: '30%', height: 50, alignItems: 'center', justifyContent: 'center', borderRadius: 12, margin: 4, borderWidth: 1, borderColor: '#24242D', backgroundColor: '#15151B' },
+  notesKeyBusy: { opacity: 0.4 },
+  notesKeyTxt: { color: '#C9CFCE', fontSize: 21, fontWeight: '600' },
+  notesKeyDel: { color: '#8E9696', fontSize: 18 },
+  notesGateFull: { flex: 1, backgroundColor: '#0B0B0F', paddingHorizontal: 16, paddingBottom: 12 },
+  notesGateTop: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 16 },
+  notesGateIconBig: { width: 104, height: 104, borderRadius: 52, borderWidth: 1, borderColor: '#3A3A44', backgroundColor: 'rgba(255,255,255,0.08)', alignItems: 'center', justifyContent: 'center', marginBottom: 20 },
+  notesGateTitleBig: { fontSize: 26, fontWeight: '800', color: '#FFFFFF', marginBottom: 8 },
+  notesGateBodyBig: { fontSize: 16, color: '#8E9696', textAlign: 'center', lineHeight: 22 },
+  notesBar: { flexDirection: 'row', alignItems: 'center', gap: 10, minHeight: 48, borderRadius: 24, borderWidth: 1, borderColor: '#24242D', backgroundColor: '#15151B', paddingHorizontal: 18 },
+  notesBarOn: { borderColor: '#3A3A44' },
+  notesBarTxt: { color: '#8E9696', fontSize: 15 },
+  notesBarInput: { flex: 1, color: '#FFFFFF', fontSize: 16, paddingVertical: 12 },
+  notesGateIconSmall: { width: 64, height: 64, borderRadius: 32, marginBottom: 12 },
+  notesGateBtnBar: { alignSelf: 'stretch', maxWidth: undefined, marginTop: 10 },
+  notesBarDots: { flexDirection: 'row', gap: 9 },
+  notesBarDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: '#FFFFFF' },
+  notesPadSheet: { marginTop: 10, marginHorizontal: -16, marginBottom: -12, paddingTop: 12, paddingBottom: 14, paddingHorizontal: 16, backgroundColor: '#15151B', borderTopLeftRadius: 16, borderTopRightRadius: 16, borderWidth: 1, borderBottomWidth: 0, borderColor: '#24242D', alignItems: 'center' },
+  notesPadGrid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', width: '100%', maxWidth: 360, marginBottom: 8 },
+  notesGateBtn: { width: '100%', maxWidth: 360, paddingVertical: 13, borderRadius: 11, backgroundColor: '#FFFFFF', alignItems: 'center' },
+  notesGateBtnOff: { opacity: 0.35 },
+  notesGateBtnTxt: { color: '#0B0B0F', fontWeight: '800', fontSize: 14 },
+  secureBox: { borderWidth: 1, borderColor: '#FFFFFF', borderRadius: 10, padding: 12, marginHorizontal: 14, marginTop: 8, marginBottom: 4, backgroundColor: 'rgba(255,255,255,0.04)' },
+  secureTitle: { color: '#FFFFFF', fontSize: 13, fontWeight: '800', marginBottom: 4 },
+  secureTxt: { color: '#8E9696', fontSize: 11, lineHeight: 15 },
+  secureBtn: { backgroundColor: '#FFFFFF', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8 },
+  secureBtnTxt: { color: '#0B0B0F', fontWeight: '800', fontSize: 12 },
+  secureBtnGhost: { borderWidth: 1, borderColor: '#3A3A44', borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8 },
+  secureBtnGhostTxt: { color: '#8E9696', fontSize: 12 },
+  fill: { flex: 1, backgroundColor: '#0B0B0F' },
   // "VEIL nice and visible top-left" (Sept 19): bigger logo mark + wider
   // letter-spacing, matches the target mock's prominent wordmark.
-  header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingTop: 18, paddingBottom: 16, borderBottomWidth: 1, borderBottomColor: '#141d25' },
+  header: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingTop: 18, paddingBottom: 16, borderBottomWidth: 1, borderBottomColor: '#24242D' },
   brandRow: { flexDirection: 'row', alignItems: 'center' },
   logoSmall: { width: 34, height: 34, marginRight: 11 },
-  logo: { color: '#7cf4c8', fontSize: 22, fontWeight: '800', letterSpacing: 7 },
-  signOut: { color: '#5a6b76', fontSize: 13 },
+  logo: { color: '#FFFFFF', fontSize: 22, fontFamily: 'Menlo', fontWeight: '600', letterSpacing: 0.5 },
+  signOut: { color: '#5E6464', fontSize: 13 },
   identityStrip: { paddingHorizontal: 20, paddingTop: 12, paddingBottom: 4 },
   // Owner request (Sept 19): Veil ID itself reads BLUE, the keychain
   // subtitle reads YELLOW (same yellow family as the Tools descriptions).
-  veilId: { color: '#7cf4c8', fontSize: 12, letterSpacing: 0.5 },
+  veilId: { color: '#FFFFFF', fontSize: 12, letterSpacing: 0.5 },
   veilIdRow: { flexDirection: 'row', alignItems: 'center', gap: 6 },
   idDot: { width: 7, height: 7, borderRadius: 3.5, backgroundColor: '#35d07f' }, // b57 green status dot
   ok: { color: '#8a6d3b', fontSize: 11, marginTop: 3 },
@@ -263,11 +343,11 @@ const styles = StyleSheet.create({
   // standard bottom nav bar with icon + label, matching the target mock.
   // SafeAreaView already wraps the whole app (b46 notch fix), so this bar
   // naturally clears the home-indicator area on notched iPhones.
-  bottomBar: { flexDirection: 'row', borderTopWidth: 1, borderTopColor: '#141d25', backgroundColor: '#0b0f14', paddingTop: 8, paddingBottom: 6 },
+  bottomBar: { flexDirection: 'row', borderTopWidth: 1, borderTopColor: '#24242D', backgroundColor: '#0B0B0F', paddingTop: 8, paddingBottom: 6 },
   bottomTab: { flex: 1, alignItems: 'center', gap: 3 },
   // b90: unread badge pinned to the top-right of the Chat tab icon
-  tabBadge: { position: 'absolute', top: -6, right: -12, backgroundColor: '#7cf4c8', borderRadius: 9, minWidth: 18, paddingHorizontal: 5, paddingVertical: 2, alignItems: 'center', justifyContent: 'center' },
-  tabBadgeText: { color: '#06231c', fontSize: 10, fontWeight: '800' },
-  bottomLabel: { color: '#4a5b66', fontSize: 10, fontWeight: '600' },
-  bottomLabelOn: { color: '#7cf4c8' },
+  tabBadge: { position: 'absolute', top: -6, right: -12, backgroundColor: '#FFFFFF', borderRadius: 9, minWidth: 18, paddingHorizontal: 5, paddingVertical: 2, alignItems: 'center', justifyContent: 'center' },
+  tabBadgeText: { color: '#0B0B0F', fontSize: 10, fontWeight: '800' },
+  bottomLabel: { color: '#5E6464', fontSize: 10, fontWeight: '600' },
+  bottomLabelOn: { color: '#FFFFFF' },
 });

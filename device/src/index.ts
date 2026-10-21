@@ -21,4 +21,7 @@ export * from './transfer';
 export * from './groups';
 export * from './group-session';
 export * from './lounge'; // b187: lounge broadcast mode (join-code listeners)
+export * from './moderation'; // Play UGC: report / block / founder removal
+export * from './session-liveness'; // Batch E R3-02
 export * from './silent-auth';
+export * from './protocol-upgrade'; // b54: veil-ratchet-5 hard cut

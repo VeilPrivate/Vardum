@@ -18,7 +18,7 @@ export function MoreScreen({ onOpenSettings, onOpenStego, onOpenSettingsTab, web
   return (
     <View style={styles.wrap}>
       <Text style={styles.h1}>More</Text>
-      <Text style={styles.p}>Additional VEIL tools and destinations.</Text>
+      <Text style={styles.p}>More Vardum tools and destinations.</Text>
 
       <TouchableOpacity style={styles.card} onPress={onOpenStego}>
         <View style={{ flex: 1 }}>
@@ -57,13 +57,13 @@ export function MoreScreen({ onOpenSettings, onOpenStego, onOpenSettingsTab, web
 
 const styles = StyleSheet.create({
   wrap: { flex: 1, padding: 16 },
-  h1: { color: '#e6eef2', fontSize: 22, fontWeight: '800', marginBottom: 4 },
-  p: { color: '#5a6b76', fontSize: 13, marginBottom: 20 },
+  h1: { color: '#FFFFFF', fontSize: 22, fontWeight: '800', marginBottom: 4 },
+  p: { color: '#8E9696', fontSize: 13, marginBottom: 20 },
   card: {
-    flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: '#1c2731',
-    borderRadius: 12, padding: 14, marginBottom: 12, backgroundColor: '#0e1620',
+    flexDirection: 'row', alignItems: 'center', borderWidth: 1, borderColor: '#24242D',
+    borderRadius: 12, padding: 14, marginBottom: 12, backgroundColor: '#15151B',
   },
-  cardTitle: { color: '#d5e3dd', fontSize: 15, fontWeight: '700', marginBottom: 4 },
-  cardSub: { color: '#5a6b76', fontSize: 12, lineHeight: 17 },
-  arrow: { color: '#5a6b76', fontSize: 16, marginLeft: 10 },
+  cardTitle: { color: '#FFFFFF', fontSize: 15, fontWeight: '700', marginBottom: 4 },
+  cardSub: { color: '#8E9696', fontSize: 12, lineHeight: 17 },
+  arrow: { color: '#5E6464', fontSize: 16, marginLeft: 10 },
 });

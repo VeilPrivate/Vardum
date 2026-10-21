@@ -51,9 +51,46 @@ export interface LockoutState {
   stage: number;
   /** epoch ms until which the keypad refuses input */
   lockedUntil: number;
+  /** Batch D (D-11): wall-clock time the current lockout began (a clock set
+   *  back past it restarts the window) */
+  lockedAt?: number;
 }
 
 export const EMPTY_LOCKOUT: LockoutState = { fails: 0, stage: 0, lockedUntil: 0 };
+
+/** Batch D (D-11, RV-18): thrown by verify() while a lockout runs. */
+export class AppLockLockedError extends Error {
+  constructor(public lockedUntil: number) {
+    super('Too many incorrect attempts. Wait for the timer, then try again.');
+    this.name = 'AppLockLockedError';
+  }
+}
+
+/** Batch D (D-11, RV-18): the lock record exists but can't be read. Callers
+ *  treat this as LOCKED — never as "no lock set". */
+export class AppLockUnreadableError extends Error {
+  constructor() {
+    super('The app lock settings on this phone could not be read. Restart Vardum and try again.');
+    this.name = 'AppLockUnreadableError';
+  }
+}
+
+/** Batch I (local review V-02): the phone refused to save the wrong-attempt
+ *  counter. verify() fails closed: no password is checked until it can be. */
+export class AppLockStorageError extends Error {
+  constructor() {
+    super('This attempt could not be recorded on this phone. Try again in a moment.');
+    this.name = 'AppLockStorageError';
+  }
+}
+
+/** Batch D (D-11): a lockout also runs on the process's monotonic clock, so
+ *  setting the phone's clock forward can't end it early while the app is open. */
+const monoLockUntil = new WeakMap<object, number>();
+/** Batch I (V-02): wrong attempts this process has seen, whatever the stored
+ *  counter says, so a counter that keeps reading empty can't reset the budget. */
+const memFails = new WeakMap<object, number>();
+const monoNow = (): number => (typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now());
 
 export function lockoutMsForStage(stage: number): number {
   const idx = Math.min(Math.max(stage, 1), LOCKOUT_MINUTES.length) - 1;
@@ -195,12 +232,18 @@ export function freshSalt(): string {
 export class AppLockStore {
   constructor(private storage: { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<unknown>; remove(k: string): Promise<unknown> }) {}
 
+  /** Batch D (D-11, RV-18): null ONLY when no lock is set. A read or parse
+   *  failure throws AppLockUnreadableError (fail closed). */
   async load(): Promise<AppLockRecord | null> {
+    let raw: string | null;
+    try { raw = await this.storage.get(APPLOCK_KEY); } catch { throw new AppLockUnreadableError(); }
+    if (raw === null || raw === undefined || raw === '') return null;
     try {
-      const raw = await this.storage.get(APPLOCK_KEY);
-      return raw ? (JSON.parse(raw) as AppLockRecord) : null;
+      const rec = JSON.parse(raw) as AppLockRecord;
+      if (!rec || typeof rec !== 'object' || typeof rec.salt !== 'string' || typeof rec.realHash !== 'string') throw new Error('shape');
+      return rec;
     } catch {
-      return null;
+      throw new AppLockUnreadableError();
     }
   }
 
@@ -218,23 +261,70 @@ export class AppLockStore {
       decoyHash: decoy ? await hashCodeAsync(decoy, salt) : null,
       duressHash: duress ? await hashCodeAsync(duress, salt) : null,
     };
-    await this.storage.set(APPLOCK_KEY, JSON.stringify(rec));
+    // Batch I (V-02): a refused write is reported, never shown as success
+    if ((await this.storage.set(APPLOCK_KEY, JSON.stringify(rec))) === false) {
+      throw new Error('The app lock could not be saved on this phone. Try again.');
+    }
     return rec;
   }
 
-  /** web Ox(): classify an entered code */
+  /**
+   * web Ox(): classify an entered code.
+   * Batch D (D-11, RV-18/RV-20): verify enforces the lockout itself (every caller
+   * — lock screen, notes gate, removing the lock — gets it), and counts the
+   * attempt as wrong BEFORE hashing, so killing the app mid-hash still costs an
+   * attempt. The real code resets the budget; decoy and duress codes neither
+   * count as wrong nor reset it (V-23). Nothing about the hash is logged.
+   */
   async verify(code: string): Promise<CodeKind | null> {
-    const t0 = Date.now();
+    const before = await this.lockout();
+    if (before.lockedUntil > Date.now()) throw new AppLockLockedError(before.lockedUntil);
     const rec = await this.load();
-    console.log(`[veil-lock] verify: record ${rec ? 'loaded' : 'MISSING'} in ${Date.now() - t0} ms`);
     if (!rec) return null;
+    // Batch I (V-02): the process's own count also gates, in case the stored
+    // counter keeps reading empty
+    const seen = memFails.get(this.storage) ?? 0;
+    if (seen >= MAX_ATTEMPTS) {
+      const until = Date.now() + lockoutMsForStage(Math.max(before.stage, 1));
+      monoLockUntil.set(this.storage, monoNow() + lockoutMsForStage(Math.max(before.stage, 1)));
+      memFails.set(this.storage, 0);
+      throw new AppLockLockedError(until);
+    }
+    // Batch I (V-02): the attempt is reserved BEFORE hashing, and a refused
+    // reservation throws (AppLockStorageError): no password is checked
+    let after: LockoutState | null = null;
+    try {
+      after = await this.recordFail();
+    } catch (e) {
+      // b63 review (I3-2): the counter can't be saved, so no password is
+      // checked, but the duress code still is. Matching it only erases this
+      // phone, so the in-memory budget is enough of a limit here.
+      if (!(e instanceof AppLockStorageError) || !rec.duressHash) throw e;
+      memFails.set(this.storage, seen + 1);
+      if ((await hashCodeAsync(code, rec.salt)) === rec.duressHash) {
+        memFails.set(this.storage, seen);
+        return 'duress';
+      }
+      throw e;
+    }
+    // b63 review (I3-3): once the stored lockout arms, it governs; the
+    // in-memory count starts again so it can't add a second window
+    memFails.set(this.storage, after.lockedUntil > Date.now() ? 0 : seen + 1);
     const t1 = Date.now();
     const h = await hashCodeAsync(code, rec.salt);
-    console.log(`[veil-lock] verify: hash in ${Date.now() - t1} ms -> ${h.slice(0, 8)}…`);
-    if (h === rec.realHash) return 'real';
-    if (rec.decoyHash && h === rec.decoyHash) return 'decoy';
-    if (rec.duressHash && h === rec.duressHash) return 'duress';
-    return null;
+    console.log(`[veil-lock] verify: hashed in ${Date.now() - t1} ms`);
+    let kind: CodeKind | null = null;
+    if (h === rec.realHash) kind = 'real';
+    else if (rec.decoyHash && h === rec.decoyHash) kind = 'decoy';
+    else if (rec.duressHash && h === rec.duressHash) kind = 'duress';
+    if (kind === 'real') {
+      await this.clearLockout();
+    } else if (kind) {
+      monoLockUntil.delete(this.storage);
+      memFails.set(this.storage, seen); // decoy and duress are not wrong attempts
+      await this.saveLockout(before).catch(() => undefined); // restoring is best-effort
+    }
+    return kind;
   }
 
   async clear(): Promise<void> {
@@ -243,23 +333,58 @@ export class AppLockStore {
 
   // ---------- b123: progressive passcode-attempt lockout (device-local) ----------
 
+  /**
+   * Batch C (V-23; review P2): fail CLOSED. An unreadable or damaged lockout
+   * record used to read as "no failures" — a reset an attacker could provoke.
+   * Now it counts as a lockout window (the first stage), persisted when the
+   * record was damaged so a restart doesn't skip it.
+   */
   async lockout(): Promise<LockoutState> {
+    let raw: string | null;
     try {
-      const raw = await this.storage.get(LOCKOUT_KEY);
-      if (!raw) return { ...EMPTY_LOCKOUT };
-      const st = JSON.parse(raw) as LockoutState;
-      return {
-        fails: Number(st.fails) || 0,
-        stage: Number(st.stage) || 0,
-        lockedUntil: Number(st.lockedUntil) || 0,
-      };
+      raw = await this.storage.get(LOCKOUT_KEY);
     } catch {
+      return { fails: 0, stage: 1, lockedUntil: Date.now() + lockoutMsForStage(1) };
+    }
+    if (!raw) {
+      // b63 review (I3-4): an empty counter doesn't end a lockout this process is enforcing
+      const mono = monoLockUntil.get(this.storage);
+      const left = mono === undefined ? 0 : mono - monoNow();
+      if (left > 0) return { fails: 0, stage: 1, lockedUntil: Date.now() + left };
+      monoLockUntil.delete(this.storage);
       return { ...EMPTY_LOCKOUT };
+    }
+    try {
+      const st = JSON.parse(raw) as LockoutState;
+      const fails = Number(st.fails), stage = Number(st.stage);
+      let lockedUntil = Number(st.lockedUntil);
+      let lockedAt = st.lockedAt === undefined ? undefined : Number(st.lockedAt);
+      if (![fails, stage, lockedUntil, lockedAt ?? 0].every((x) => Number.isFinite(x) && x >= 0)) throw new Error('shape');
+      // Batch D (D-11): a clock set back past the lockout's start restarts the window
+      if (lockedAt !== undefined && Date.now() < lockedAt) {
+        lockedAt = Date.now();
+        lockedUntil = lockedAt + lockoutMsForStage(stage);
+        await this.saveLockout({ fails, stage, lockedUntil, lockedAt }).catch(() => undefined);
+      }
+      // Batch D (D-11): while the app runs, the monotonic clock decides too
+      const mono = monoLockUntil.get(this.storage);
+      if (mono !== undefined) {
+        const left = mono - monoNow();
+        // only when the wall clock says the window is over (a clock set forward)
+        if (left > 0 && lockedUntil <= Date.now()) lockedUntil = Date.now() + left;
+        else monoLockUntil.delete(this.storage);
+      }
+      return { fails, stage, lockedUntil, ...(lockedAt !== undefined ? { lockedAt } : {}) };
+    } catch {
+      const locked = { fails: 0, stage: 1, lockedUntil: Date.now() + lockoutMsForStage(1) };
+      await this.saveLockout(locked).catch(() => undefined);
+      return locked;
     }
   }
 
   private async saveLockout(st: LockoutState): Promise<void> {
-    await this.storage.set(LOCKOUT_KEY, JSON.stringify(st));
+    // Batch I (V-02): KeychainStorage.set reports a refused write as false
+    if ((await this.storage.set(LOCKOUT_KEY, JSON.stringify(st))) === false) throw new AppLockStorageError();
   }
 
   /** one wrong attempt. At MAX_ATTEMPTS the keypad locks: stage escalates
@@ -274,13 +399,17 @@ export class AppLockStore {
       return next;
     }
     const stage = st.stage + 1;
-    const next = { fails: 0, stage, lockedUntil: Date.now() + lockoutMsForStage(stage) };
+    const ms = lockoutMsForStage(stage);
+    const next = { fails: 0, stage, lockedUntil: Date.now() + ms, lockedAt: Date.now() };
+    monoLockUntil.set(this.storage, monoNow() + ms);
     await this.saveLockout(next);
     return next;
   }
 
   /** successful unlock — counter and escalation reset to zero */
   async clearLockout(): Promise<void> {
+    monoLockUntil.delete(this.storage);
+    memFails.delete(this.storage);
     await this.storage.remove(LOCKOUT_KEY);
   }
 }

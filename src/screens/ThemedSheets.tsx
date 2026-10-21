@@ -138,7 +138,7 @@ function ThemedShareView({
     <View style={styles.backdrop}>
       <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={onClose} />
       <View style={styles.card}>
-        <Text style={styles.title}>{spec.title || 'Share your Veil ID'}</Text>
+        <Text style={styles.title}>{spec.title || 'Share your Vardum ID'}</Text>
         <View style={styles.valueBox}>
           <Text style={styles.valueText} selectable>{spec.value}</Text>
         </View>
@@ -161,7 +161,7 @@ function ThemedShareView({
 const styles = StyleSheet.create({
   backdrop: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(4,8,12,0.86)',
+    backgroundColor: 'rgba(11,11,15,0.86)',
     justifyContent: 'center',
     alignItems: 'center',
     padding: 22,
@@ -169,53 +169,53 @@ const styles = StyleSheet.create({
   },
   card: {
     width: '100%', maxWidth: 420,
-    backgroundColor: '#101920',
+    backgroundColor: '#15151B',
     borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#22323d',
+    borderColor: '#24242D',
     padding: 18,
   },
-  title: { color: '#e8f4ef', fontSize: 15, fontWeight: '800', marginBottom: 6 },
-  message: { color: '#8fa3ad', fontSize: 12, lineHeight: 17, marginBottom: 12 },
+  title: { color: '#FFFFFF', fontSize: 15, fontWeight: '800', marginBottom: 6 },
+  message: { color: '#8E9696', fontSize: 12, lineHeight: 17, marginBottom: 12 },
   optionRow: {
-    backgroundColor: '#0b1218',
+    backgroundColor: '#0B0B0F',
     borderWidth: 1,
-    borderColor: '#1f4a42',
+    borderColor: '#3A3A44',
     borderRadius: 10,
     paddingVertical: 11,
     paddingHorizontal: 14,
     marginBottom: 8,
   },
-  optionLabel: { color: '#7cf4c8', fontSize: 14, fontWeight: '700' },
-  optionSub: { color: '#8fa3ad', fontSize: 11, marginTop: 2 },
+  optionLabel: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
+  optionSub: { color: '#8E9696', fontSize: 11, marginTop: 2 },
   valueBox: {
-    backgroundColor: '#0b1218',
+    backgroundColor: '#0B0B0F',
     borderWidth: 1,
-    borderColor: '#2a3d49',
+    borderColor: '#3A3A44',
     borderRadius: 10,
     padding: 12,
     marginVertical: 10,
   },
-  valueText: { color: '#e8f4ef', fontSize: 15, fontWeight: '700', lineHeight: 21 },
+  valueText: { color: '#FFFFFF', fontSize: 15, fontWeight: '700', lineHeight: 21 },
   kicker: { color: '#d69a5c', fontSize: 11, marginBottom: 10 },
-  status: { color: '#7cf4c8', fontSize: 11, fontWeight: '700', marginBottom: 10 },
+  status: { color: '#FFFFFF', fontSize: 11, fontWeight: '700', marginBottom: 10 },
   btn: {
-    backgroundColor: '#12211d',
+    backgroundColor: '#15151B',
     borderWidth: 1,
-    borderColor: '#1f4a42',
+    borderColor: '#3A3A44',
     borderRadius: 10,
     paddingVertical: 11,
     alignItems: 'center',
     marginBottom: 8,
   },
-  btnText: { color: '#7cf4c8', fontSize: 14, fontWeight: '700' },
+  btnText: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
   btnGhost: {
     borderWidth: 1,
-    borderColor: '#22323d',
+    borderColor: '#24242D',
     borderRadius: 10,
     paddingVertical: 10,
     alignItems: 'center',
     marginBottom: 8,
   },
-  btnGhostText: { color: '#8fa3ad', fontSize: 13, fontWeight: '600' },
+  btnGhostText: { color: '#8E9696', fontSize: 13, fontWeight: '600' },
 });

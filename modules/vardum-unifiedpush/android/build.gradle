@@ -1,0 +1,30 @@
+apply plugin: 'com.android.library'
+
+group = 'app.tryvardum.unifiedpush'
+version = '1.0.0'
+
+// Expo SDK 52 helper (same pattern as modules/veil-crypto/android/build.gradle)
+def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
+apply from: expoModulesCorePlugin
+applyKotlinExpoModulesCorePlugin()
+useCoreDependencies()
+useDefaultAndroidSdkVersions()
+useExpoPublishing()
+
+android {
+  namespace "app.tryvardum.unifiedpush"
+  defaultConfig {
+    versionCode 1
+    versionName "1.0.0"
+  }
+  lint {
+    abortOnError false
+  }
+}
+
+dependencies {
+  // UnifiedPush connector only. Deliberately NOT the embedded-fcm-distributor:
+  // the GrapheneOS build carries no Google push library of its own.
+  implementation "org.unifiedpush.android:connector:3.0.9"
+  implementation "androidx.core:core:1.13.1"
+}

@@ -1,0 +1,58 @@
+apply plugin: 'com.android.library'
+
+group = 'expo.modules.veilcrypto'
+version = '1.0.0'
+
+// Expo SDK 52 helper (same pattern as node_modules/expo-clipboard/android/build.gradle)
+def expoModulesCorePlugin = new File(project(":expo-modules-core").projectDir.absolutePath, "ExpoModulesCorePlugin.gradle")
+apply from: expoModulesCorePlugin
+applyKotlinExpoModulesCorePlugin()
+useCoreDependencies()
+useDefaultAndroidSdkVersions()
+useExpoPublishing()
+
+// Same ABI list the app is built for (-PreactNativeArchitectures=...).
+def reactNativeArchitectures() {
+  def value = rootProject.findProperty("reactNativeArchitectures")
+  return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
+}
+
+android {
+  namespace "expo.modules.veilcrypto"
+  ndkVersion rootProject.ext.has("ndkVersion") ? rootProject.ext.ndkVersion : "26.1.10909125"
+  defaultConfig {
+    versionCode 1
+    versionName "1.0.0"
+    externalNativeBuild {
+      cmake {
+        abiFilters(*reactNativeArchitectures())
+      }
+    }
+  }
+  // libveilkdf — native PBKDF2-HMAC-SHA256 (src/main/cpp)
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+      version "3.22.1"
+    }
+  }
+  lint {
+    abortOnError false
+  }
+  testOptions {
+    unitTests.all { test ->
+      test.testLogging { showStandardStreams = true }
+      // -PveilkdfLibDir=<dir> runs Pbkdf2Sha256Test against a host build of
+      // the C code instead of the javax.crypto fallback.
+      if (project.hasProperty("veilkdfLibDir")) {
+        test.systemProperty "java.library.path", project.property("veilkdfLibDir")
+        test.systemProperty "veilkdf.requireNative", "true"
+      }
+    }
+  }
+}
+
+dependencies {
+  implementation "androidx.biometric:biometric:1.1.0"
+  testImplementation "junit:junit:4.13.2"
+}

@@ -37,7 +37,21 @@ export interface SilentCredentials {
 
 /** Normalise a phrase exactly like the restore flow does (case/space tolerant). */
 function normalisePhrase(phrase: string): string {
-  return phrase.trim().toLowerCase().split(/\s+/).filter(Boolean).join(' ');
+  return canonicalPhrase(phrase);
+}
+
+/**
+ * b199 (owner hardware repro, Oct 16): the ONE canonical form of a recovery
+ * phrase — lowercase a-z words separated by single spaces. Everything a
+ * keyboard or a paste can add is dropped: iOS turns a double space into
+ * ". ", notes apps add numbering ("1. abandon"), pastes carry newlines,
+ * commas or non-breaking spaces. Without this, "ability. able" derived a
+ * DIFFERENT sign-in than "ability able" and the restore fell through to the
+ * email screen. BIP39 words are a-z only, so a correct phrase is unchanged —
+ * every existing derivation (sign-up uses the generated words) still matches.
+ */
+export function canonicalPhrase(phrase: string): string {
+  return String(phrase ?? '').normalize('NFKD').toLowerCase().replace(/[^a-z]+/g, ' ').trim();
 }
 
 function hex(bytes: Uint8Array): string {
@@ -93,7 +107,10 @@ export async function provisionSilentAccount(deps: SilentAuthDeps, phrase: strin
     if (r.status >= 400) throw new SilentAccountUnavailableError(`relay status ${r.status}`);
   } catch (e) {
     if (isUnavailable(e)) throw new SilentAccountUnavailableError();
-    throw e;
+    // b199: a retry after a half-finished first attempt (account created,
+    // app closed before sign-in) finds the account already there — that is
+    // success, not an error: sign in with the same derived credentials
+    if (!/already registered/i.test(String((e as Error)?.message ?? e))) throw e;
   }
   // standard platform login — may itself demand OTP if the server-side
   // provisioning half exists but didn't pre-verify; that surfaces to the
@@ -110,4 +127,22 @@ export async function provisionSilentAccount(deps: SilentAuthDeps, phrase: strin
 export async function silentLogin(deps: SilentAuthDeps, phrase: string): Promise<AuthSession> {
   const creds = await deriveSilentCredentials(phrase);
   return deps.auth.login(creds.email, creds.password);
+}
+
+/** b199: true when an account label is a phrase-derived one (never a real
+ *  or made-up email the user typed). */
+export function isSilentAccountEmail(email: string | null | undefined): boolean {
+  return /^v[0-9a-f]{24}@veil\.app$/.test(String(email ?? '').toLowerCase());
+}
+
+/**
+ * b199: point the SIGNED-IN account at the credentials derived from `phrase`
+ * (relay veilSilentAccount action 'rebind'). Used when "Generate new Veil ID"
+ * retires the phrase the account was derived from, and when a made-up-email
+ * account switches to 24-word sign-in. Only the derived label + password
+ * leave the device; the account's data is untouched.
+ */
+export async function rebindSilentAccount(deps: SilentAuthDeps, phrase: string): Promise<void> {
+  const creds = await deriveSilentCredentials(phrase);
+  await deps.relay.invoke('veilSilentAccount', { action: 'rebind', email: creds.email, password: creds.password });
 }

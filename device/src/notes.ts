@@ -15,6 +15,24 @@ import { aesGcmKey } from './kdf';
 import { hkdf } from '../../crypto-core/src/kdf';
 
 export const NOTES_KEY_STORAGE = 'veil_notes_key';
+/** Batch C (B8): device-local newest-version-seen per note id */
+export const NOTES_VERSIONS_STORAGE = 'veil_notes_versions';
+
+/** Batch C (B8): a note's binding — client-chosen id (32 hex) and version (1, 2, ...). */
+export interface NoteMeta { nid: string; version: number }
+
+export function newNoteId(): string {
+  return [...randomBytes(16)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/** meta stored on a relay row (note_nid, note_v), or null for a pre-Batch-C row */
+export function noteMetaOf(row: { note_nid?: unknown; note_v?: unknown }): NoteMeta | null {
+  return typeof row.note_nid === 'string' && Number.isInteger(row.note_v) ? { nid: row.note_nid, version: Number(row.note_v) } : null;
+}
+
+function noteAad(meta: NoteMeta): Uint8Array {
+  return utf8(`vardum-note-v2:${meta.nid}:${meta.version}`);
+}
 
 export interface NotePayload {
   title: string;
@@ -79,28 +97,59 @@ export class NotesStore {
     this.key = await aesGcmKey(this.b64ToBytes(rawB64));
   }
 
-/** web Zd(): encrypt { title, body } -> VeilNote record fields. */
-  async encryptNote(note: NotePayload): Promise<EncryptedNote> {
+/**
+   * web Zd(): encrypt { title, body } -> VeilNote record fields.
+   * Batch C (B8; reviews P2, P3 R6): with `meta`, the ciphertext is bound to a
+   * client-chosen note id and a version number (AES-GCM associated data), so
+   * the relay can't move a note's content to another note, and an older
+   * version served back is refused by a device that has seen a newer one.
+   */
+  async encryptNote(note: NotePayload, meta?: NoteMeta): Promise<EncryptedNote> {
     const key = await this.getKey();
     const iv = randomBytes(12);
     const pt = utf8(JSON.stringify(note));
     const ct = new Uint8Array(
-      await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv as unknown as BufferSource }, key, pt as unknown as BufferSource),
+      await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv: iv as unknown as BufferSource, ...(meta ? { additionalData: noteAad(meta) as unknown as BufferSource } : {}) },
+        key, pt as unknown as BufferSource,
+      ),
     );
+    if (meta) await this.noteVersionSeen(meta);
     return { ciphertext: toB64(ct), iv: toB64(iv), byteLength: ct.length };
   }
 
-  /** web Qd(): decrypt VeilNote payload fields -> { title, body }. */
-  async decryptNote(ciphertext: string, iv: string): Promise<NotePayload> {
+  /** web Qd(): decrypt VeilNote payload fields -> { title, body }.
+   *  Batch C (B8): rows carrying note_nid / note_v decrypt only with that
+   *  binding and only if not older than the newest version this device saw.
+   *  Pre-Batch-C rows (no meta) still open; they get the binding on their next save. */
+  async decryptNote(ciphertext: string, iv: string, meta?: NoteMeta | null): Promise<NotePayload> {
     const key = await this.getKey();
+    if (meta) {
+      if (!/^[0-9a-f]{32}$/.test(meta.nid) || !Number.isInteger(meta.version) || meta.version < 1) throw new Error('Malformed note.');
+      const seen = (await this.versions())[meta.nid] ?? 0;
+      if (meta.version < seen) throw new Error('This note was rolled back to an older version.');
+    }
     const pt = new Uint8Array(
       await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: this.b64ToBytes(iv) as unknown as BufferSource },
+        { name: 'AES-GCM', iv: this.b64ToBytes(iv) as unknown as BufferSource, ...(meta ? { additionalData: noteAad(meta) as unknown as BufferSource } : {}) },
         key,
         this.b64ToBytes(ciphertext) as unknown as BufferSource,
       ),
     );
+    if (meta) await this.noteVersionSeen(meta);
     return JSON.parse(new TextDecoder().decode(pt)) as NotePayload;
+  }
+
+  /** Batch C (B8): newest version seen per note id (device-local high-water marks). */
+  private async versions(): Promise<Record<string, number>> {
+    try { return JSON.parse((await this.get(NOTES_VERSIONS_STORAGE)) || '{}') as Record<string, number>; } catch { return {}; }
+  }
+
+  private async noteVersionSeen(meta: NoteMeta): Promise<void> {
+    const v = await this.versions();
+    if ((v[meta.nid] ?? 0) >= meta.version) return;
+    v[meta.nid] = meta.version;
+    try { await this.set(NOTES_VERSIONS_STORAGE, JSON.stringify(v)); } catch { /* best-effort: RAM-only devices re-learn */ }
   }
 
   private b64ToBytes(b64: string): Uint8Array {
@@ -179,7 +228,10 @@ export async function adoptNotesIdentityKey(
   return 'ok';
 }
 
-/** The VeilNote entity record (web parity field names). */
-export function noteRecord(enc: EncryptedNote): Record<string, unknown> {
-  return { payload_ciphertext: enc.ciphertext, payload_iv: enc.iv, byte_length: enc.byteLength };
+/** The VeilNote entity record (web parity field names; Batch C adds note_nid / note_v). */
+export function noteRecord(enc: EncryptedNote, meta?: NoteMeta): Record<string, unknown> {
+  return {
+    payload_ciphertext: enc.ciphertext, payload_iv: enc.iv, byte_length: enc.byteLength,
+    ...(meta ? { note_nid: meta.nid, note_v: meta.version } : {}),
+  };
 }

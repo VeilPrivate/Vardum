@@ -12,6 +12,7 @@ import type { RatchetStateSerialized } from '../../crypto-core/src/index';
 import type { VeilStorage } from '../../crypto-core/src/index';
 import { secureRemove } from './secure-wipe';
 import type { ChatMessage } from './chat';
+import { parseAnchor, type BackfillAnchor } from './backfill';
 
 export class SessionStore {
   constructor(private storage: VeilStorage) {}
@@ -47,6 +48,7 @@ export class SessionStore {
     }
     await secureRemove(this.storage, this.procKey(token));
     await secureRemove(this.storage, this.skipKey(token));
+    await secureRemove(this.storage, this.backfillKey(token));
     await secureRemove(this.storage, this.unreadKey(token));
     await secureRemove(this.storage, this.strayKey(token));
     await secureRemove(this.storage, this.strayPendingKey(token));
@@ -216,14 +218,21 @@ export class SessionStore {
     return `veil_pendburn_${token}`;
   }
 
-  async pendingBurns(token: string): Promise<{ id: string; attempts: number; displayed?: boolean; blob?: string; blobDeleteAt?: number }[]> {
+  async pendingBurns(token: string): Promise<{ id: string; attempts: number; displayed?: boolean; blob?: string; blobDeleteAt?: number; retryAt?: number; failingSince?: number }[]> {
     const raw = await this.storage.get(this.pendingBurnKey(token));
     try { return raw ? (JSON.parse(raw) as { id: string; attempts: number }[]) : []; } catch { return []; }
   }
 
-  async setPendingBurns(token: string, list: { id: string; attempts: number; displayed?: boolean; blob?: string; blobDeleteAt?: number }[]): Promise<void> {
-    if (!list.length) { await secureRemove(this.storage, this.pendingBurnKey(token)); return; }
-    await this.storage.set(this.pendingBurnKey(token), JSON.stringify(list.slice(-200)));
+  async setPendingBurns(token: string, list: { id: string; attempts: number; displayed?: boolean; blob?: string; blobDeleteAt?: number; retryAt?: number; failingSince?: number }[]): Promise<{ saved: boolean; full: boolean }> {
+    if (!list.length) { await secureRemove(this.storage, this.pendingBurnKey(token)); return { saved: true, full: false }; }
+    // Batch F (R4-4-12): keep up to 2000 (was 200, which silently dropped burns)
+    const full = list.length > 2000;
+    if (full) console.log(`[veil] pending burn queue for #${token.slice(0, 4)} over 2000 — oldest dropped`);
+    // Batch H (round-6 review R6-1-10 / R5-1-09): the write result is checked and,
+    // with a full queue, reported to the caller (the thread says so)
+    const saved = (await this.storage.set(this.pendingBurnKey(token), JSON.stringify(list.slice(-2000))).catch(() => false)) !== false;
+    if (!saved) console.log(`[veil] pending burn queue for #${token.slice(0, 4)} not saved (storage refused)`);
+    return { saved, full };
   }
 
   // ---------- envelope-list pagination cursor (b87) ----------
@@ -244,6 +253,24 @@ export class SessionStore {
   // be skipped by the per-record expiry check regardless).
   private skipKey(token: string): string {
     return `veil_syncskip_${token}`;
+  }
+
+  // ---------- deep-backlog anchor (audit doc 13, R1) ----------
+  // Set only while a sync pass is still descending a backlog deeper than its
+  // fetch cap (see backfill.ts); absent otherwise. Losing it is harmless:
+  // the next pass just starts the descent from the top again.
+  private backfillKey(token: string): string {
+    return `veil_backfill_${token}`;
+  }
+
+  async backfillAnchor(token: string): Promise<BackfillAnchor | null> {
+    const raw = await this.storage.get(this.backfillKey(token));
+    try { return raw ? parseAnchor(JSON.parse(raw)) : null; } catch { return null; }
+  }
+
+  async setBackfillAnchor(token: string, anchor: BackfillAnchor | null): Promise<void> {
+    if (anchor) await this.storage.set(this.backfillKey(token), JSON.stringify(anchor));
+    else await this.storage.remove(this.backfillKey(token));
   }
 
   async syncSkip(token: string): Promise<number> {
@@ -478,6 +505,32 @@ export class SessionStore {
       return m;
     });
     if (changed) await this.cacheWrite(token, out);
+  }
+
+  /** b199: persist a reaction on the cached message whose id or envId is
+   *  `target` (side 'mine' = this device's, 'peer' = the other person's). */
+  async setCachedReaction(token: string, target: string, side: 'mine' | 'peer', emoji: string | null): Promise<void> {
+    const list = await this.cacheRead(token);
+    let changed = false;
+    const out = list.map((m) => {
+      if (m.id !== target && m.envId !== target) return m;
+      changed = true;
+      const reactions = { ...(m.reactions ?? {}) };
+      if (emoji) reactions[side] = emoji; else delete reactions[side];
+      return { ...m, reactions };
+    });
+    if (changed) await this.cacheWrite(token, out);
+  }
+
+  /** Play UGC: drop cached rows whose id or envId is listed (founder removal).
+   *  Returns how many rows were removed. */
+  async removeCachedMessages(token: string, ids: string[]): Promise<number> {
+    if (!ids.length) return 0;
+    const set = new Set(ids);
+    const list = await this.cacheRead(token);
+    const out = list.filter((m) => !set.has(m.id) && !(m.envId && set.has(m.envId)));
+    if (out.length !== list.length) await this.cacheWrite(token, out);
+    return list.length - out.length;
   }
 
   /** b123: bind a relay envelope id onto a locally-sent group bubble

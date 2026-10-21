@@ -8,7 +8,7 @@ Pod::Spec.new do |s|
   s.summary        = package['description']
   s.description    = package['description']
   s.license        = 'Proprietary'
-  s.author         = 'VEIL'
+  s.author         = 'Vardum'
   s.homepage       = 'https://veil.privacy'
   s.platforms      = { :ios => '15.1' }
   s.source         = { :git => '' }

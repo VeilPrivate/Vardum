@@ -3,5 +3,5 @@
   "version": "1.0.0",
   "private": true,
   "main": "index.ts",
-  "description": "VEIL local Expo module: native iOS PBKDF2-SHA256 via CommonCrypto (byte-identical to the web contract, milliseconds instead of minutes of pure-JS hashing)."
+  "description": "Vardum local Expo module: native iOS PBKDF2-SHA256 via CommonCrypto (byte-identical to the web contract, milliseconds instead of minutes of pure-JS hashing)."
 }

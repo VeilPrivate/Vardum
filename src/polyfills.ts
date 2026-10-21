@@ -55,7 +55,7 @@ if (eu && typeof eu.setGlobalHandler === 'function') {
     } catch { /* keychain unavailable — marker stays unwritten */ }
     try {
       const { Alert } = require('react-native');
-      Alert.alert('VEIL error — photograph this screen', msg + '\n\n' + stack.slice(0, 600));
+      Alert.alert('Vardum error — photograph this screen', msg + '\n\n' + stack.slice(0, 600));
     } catch {
       // Alert unavailable — the global above still holds the message.
     }

@@ -74,7 +74,11 @@ public class VeilCryptoModule: Module {
       let eph = try P256.KeyAgreement.PrivateKey()
       let shared = try eph.sharedSecretFromKeyAgreement(with: seKey.publicKey)
       var salt = Data(count: 32)
-      _ = salt.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+      // D-19 (RV-16): a failed CSPRNG call must not leave an all-zero salt.
+      let rng = salt.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+      if rng != errSecSuccess {
+        throw NSError(domain: "VeilCrypto", code: 45, userInfo: [NSLocalizedDescriptionKey: "seWrapKey: SecRandomCopyBytes failed (\(rng))"])
+      }
       let sym = shared.hkdfDerivedSymmetricKey(using: SHA256.self, salt: salt, sharedInfo: Data("veil-se-wrap-v1".utf8), outputByteCount: 32)
       let sealed = try AES.GCM.seal(master!, using: sym)
       guard let combined = sealed.combined else {
@@ -88,6 +92,7 @@ public class VeilCryptoModule: Module {
     }
 
     AsyncFunction("seUnwrapKey") { (ephB64: String, saltB64: String, ctB64: String) -> String in
+      // (try? on an Optional-returning call flattens in Swift 5: nil = no key or error)
       guard let seKey = try? VeilCryptoModule.loadSeKey() else {
         throw NSError(domain: "VeilCrypto", code: 42, userInfo: [NSLocalizedDescriptionKey: "seUnwrapKey: Secure Enclave key unavailable (re-enrolled biometrics?)"])
       }
@@ -112,9 +117,20 @@ public class VeilCryptoModule: Module {
     // surviving b96-b101: "none of the modes ask me for biometrics"). Only
     // safe to call when the keyvault identity is in memory and is about to be
     // re-sealed: the old sealed blob becomes unreadable the moment this runs.
+    // D-19 (RV-16): the delete used to ignore its status (and passed a query
+    // carrying kSecReturnData), so a failed delete silently kept the old,
+    // ungated key and still returned true. Now: delete with a plain match
+    // query, accept only success / not-found, confirm the item is gone, and
+    // always CREATE a fresh key (never reuse whatever is there).
     AsyncFunction("seResetKey") { () -> Bool in
-      SecItemDelete(VeilCryptoModule.seQuery() as CFDictionary)
-      _ = try VeilCryptoModule.loadOrCreateSeKey()
+      let del = SecItemDelete(VeilCryptoModule.seMatchQuery() as CFDictionary)
+      if del != errSecSuccess && del != errSecItemNotFound {
+        throw NSError(domain: "VeilCrypto", code: 46, userInfo: [NSLocalizedDescriptionKey: "seResetKey: SecItemDelete failed (\(del))"])
+      }
+      if try VeilCryptoModule.loadSeKey() != nil {
+        throw NSError(domain: "VeilCrypto", code: 46, userInfo: [NSLocalizedDescriptionKey: "seResetKey: old Secure Enclave key still present after delete"])
+      }
+      _ = try VeilCryptoModule.createSeKey()
       return true
     }
 
@@ -123,17 +139,31 @@ public class VeilCryptoModule: Module {
         if salt.isEmpty {
           throw NSError(domain: "VeilCrypto", code: 1, userInfo: [NSLocalizedDescriptionKey: "invalid salt hex"])
         }
-        let pw = password.cString(using: .utf8) ?? []
-        if pw.count < 1 {
-          throw NSError(domain: "VeilCrypto", code: 2, userInfo: [NSLocalizedDescriptionKey: "password encoding failed"])
+        // RV-27: same bounds as the JS entry point (vendor/device/src/kdf.ts
+        // pbkdf2Sha256Bytes). Also keeps UInt32(iterations) and the dkLen
+        // allocation below from trapping on out-of-range input.
+        if iterations < VeilCryptoModule.pbkdf2MinIterations || iterations > VeilCryptoModule.pbkdf2MaxIterations
+            || dkLen < 16 || dkLen > 64 {
+          throw NSError(domain: "VeilCrypto", code: 3, userInfo: [NSLocalizedDescriptionKey: "pbkdf2Sha256: unsupported iterations or dkLen"])
         }
+        // RV-28: hash the raw UTF-8 bytes, like JS and Android. cString(using:)
+        // could stop at an embedded NUL. The 1-byte pad only gives an empty
+        // password a valid pointer; the length passed is the real one.
+        var pw = Array(password.utf8)
+        let pwLen = pw.count
+        if pw.isEmpty { pw = [0] }
         var derived = [UInt8](repeating: 0, count: dkLen)
+        // RV-29: clear the password copy and the derived bytes once done.
+        defer {
+          VeilCryptoModule.wipe(&pw)
+          VeilCryptoModule.wipe(&derived)
+        }
         let status: Int32 = pw.withUnsafeBufferPointer { pwBuf -> Int32 in
           salt.withUnsafeBufferPointer { saltBuf -> Int32 in
             derived.withUnsafeMutableBufferPointer { dBuf -> Int32 in
               CCKeyDerivationPBKDF(
                 CCPBKDFAlgorithm(kCCPBKDF2),
-                pwBuf.baseAddress, pw.count - 1, // exclude the NUL terminator; length is explicit
+                pwBuf.baseAddress, pwLen,
                 saltBuf.baseAddress, salt.count,
                 CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
                 UInt32(iterations),
@@ -233,52 +263,91 @@ public class VeilCryptoModule: Module {
   private static let seKeyService = "au.com.mattthemagicalmentalist.veil.se-key"
   private static let seKeyAccount = "veil-se"
 
-  private static func seAccessControl() -> SecAccessControl? {
-    SecAccessControlCreateWithFlags(
+  // D-19 (RV-16): every step of the SE key lifecycle now fails closed.
+  // Before, a nil access control silently created a key with NO biometric
+  // gate, and the SecItemAdd / SecItemDelete / SecItemCopyMatching statuses
+  // were ignored (a key could be used to seal without ever being stored, and
+  // seResetKey could silently keep the old key).
+  private static func seAccessControl() throws -> SecAccessControl {
+    var err: Unmanaged<CFError>?
+    guard let acl = SecAccessControlCreateWithFlags(
       kCFAllocatorDefault,
       kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
       [.privateKeyUsage, .biometryCurrentSet],
-      nil
-    )
+      &err
+    ) else {
+      let why = err.map { String(describing: $0.takeRetainedValue()) } ?? "unknown"
+      throw NSError(domain: "VeilCrypto", code: 47, userInfo: [NSLocalizedDescriptionKey: "Secure Enclave access control could not be created (\(why)); refusing to create an ungated key"])
+    }
+    return acl
   }
 
-  private static func seQuery() -> [String: Any] {
+  /// Match-only query (no return-type keys): safe for SecItemDelete.
+  private static func seMatchQuery() -> [String: Any] {
     [
       kSecClass as String: kSecClassGenericPassword,
       kSecAttrService as String: seKeyService,
       kSecAttrAccount as String: seKeyAccount,
-      kSecReturnData as String: true,
     ]
   }
 
-  /// Load the stored SE key representation, if any (the raw blob itself is
-  /// useless outside this device's Secure Enclave — that is the point).
-  private static func loadSeKey() throws -> SecureEnclave.P256.KeyAgreement.PrivateKey {
+  /// Load the stored SE key representation (the raw blob itself is useless
+  /// outside this device's Secure Enclave — that is the point).
+  /// Returns nil ONLY when no item exists (errSecItemNotFound). Any other
+  /// keychain status (e.g. errSecInteractionNotAllowed while locked) or an
+  /// unreadable stored blob throws, so callers never mistake "can't read it
+  /// right now" for "there is none" and mint a replacement key.
+  private static func loadSeKey() throws -> SecureEnclave.P256.KeyAgreement.PrivateKey? {
+    var q = seMatchQuery()
+    q[kSecReturnData as String] = true
+    q[kSecMatchLimit as String] = kSecMatchLimitOne
     var item: CFTypeRef?
-    let status = SecItemCopyMatching(seQuery() as CFDictionary, &item)
-    guard status == errSecSuccess, let data = item as? Data,
-          let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(
-            dataRepresentation: data) else {
-      throw NSError(domain: "VeilCrypto", code: 44, userInfo: [NSLocalizedDescriptionKey: "SE key not found"])
+    let status = SecItemCopyMatching(q as CFDictionary, &item)
+    if status == errSecItemNotFound { return nil }
+    guard status == errSecSuccess else {
+      throw NSError(domain: "VeilCrypto", code: 44, userInfo: [NSLocalizedDescriptionKey: "SE key lookup failed (\(status))"])
+    }
+    guard let data = item as? Data,
+          let key = try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: data) else {
+      throw NSError(domain: "VeilCrypto", code: 44, userInfo: [NSLocalizedDescriptionKey: "stored SE key is unreadable (reset needed)"])
+    }
+    return key
+  }
+
+  /// Create a new biometry-gated SE key and persist it. Throws if the access
+  /// control can't be built or the keychain write fails — a key that was not
+  /// stored is never returned (anything sealed to it would be lost).
+  private static func createSeKey() throws -> SecureEnclave.P256.KeyAgreement.PrivateKey {
+    let acl = try seAccessControl()
+    let key = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: acl)
+    var add = seMatchQuery()
+    add[kSecValueData as String] = key.dataRepresentation
+    // Explicit class (RV-57): the item holds only an SE handle, useless on
+    // another device, so it must never travel in a backup or restore.
+    add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+    let status = SecItemAdd(add as CFDictionary, nil)
+    guard status == errSecSuccess else {
+      throw NSError(domain: "VeilCrypto", code: 48, userInfo: [NSLocalizedDescriptionKey: "SE key could not be stored (SecItemAdd \(status))"])
     }
     return key
   }
 
   /// Load the existing SE key or create + persist a new biometry-gated one.
   private static func loadOrCreateSeKey() throws -> SecureEnclave.P256.KeyAgreement.PrivateKey {
-    if let existing = try? loadSeKey() { return existing }
-    let acl = seAccessControl()
-    let key: SecureEnclave.P256.KeyAgreement.PrivateKey
-    if let acl = acl {
-      key = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: acl)
-    } else {
-      key = try SecureEnclave.P256.KeyAgreement.PrivateKey()
+    if let existing = try loadSeKey() { return existing }
+    return try createSeKey()
+  }
+
+  /// Must match PBKDF2_MIN_ITERATIONS / PBKDF2_MAX_ITERATIONS in vendor/device/src/kdf.ts.
+  private static let pbkdf2MinIterations = 100_000
+  private static let pbkdf2MaxIterations = 1_000_000
+
+  /// Zero a byte buffer in place (memset_s is never optimised away).
+  private static func wipe(_ bytes: inout [UInt8]) {
+    let n = bytes.count
+    bytes.withUnsafeMutableBytes { buf in
+      if let p = buf.baseAddress { _ = memset_s(p, n, 0, n) }
     }
-    var add = seQuery()
-    add[kSecReturnData as String] = nil
-    add[kSecValueData as String] = key.dataRepresentation
-    SecItemAdd(add as CFDictionary, nil)
-    return key
   }
 
   private static func hexToBytes(_ hex: String) -> [UInt8] {

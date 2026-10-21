@@ -340,7 +340,10 @@ export const nobleSubtle = {
   ): Promise<boolean> {
     const name = typeof algorithm === 'string' ? algorithm : (algorithm as Record<string, string>).name;
     if (name === 'Ed25519' && key.m.k === 'ed25519') {
-      return ed25519.verify(bytes(signature), bytes(data), key.m.pub);
+      // b54 (pre-audit T-2): strict RFC 8032 verification — noble's default
+      // ZIP-215 rules accept a forged signature under a small-order public key
+      // and disagree with the relay's (WebCrypto, strict) verifier
+      try { return ed25519.verify(bytes(signature), bytes(data), key.m.pub, { zip215: false }); } catch { return false; }
     }
     if (name === 'HMAC' && key.m.k === 'hmac') {
       const expect = hmac(hashFn(key.m.hash), key.m.key, bytes(data));
@@ -398,9 +401,13 @@ export const nobleSubtle = {
         if (nat) {
           try {
             const t0 = Date.now();
-            const outB64 = await nat.aesGcmEncrypt(toHexLocal(key.m.key), toHexLocal(iv), toB64(pt), aad ? toHexLocal(aad) : '');
-            console.log(`[veil-aes] encrypt NATIVE ${pt.length}B in ${Date.now() - t0} ms`);
-            return ab(fromB64(outB64));
+            const inB64 = toB64(pt);
+            const t1 = Date.now();
+            const outB64 = await nat.aesGcmEncrypt(toHexLocal(key.m.key), toHexLocal(iv), inB64, aad ? toHexLocal(aad) : '');
+            const t2 = Date.now();
+            const out = fromB64(outB64);
+            console.log(`[veil-aes] encrypt NATIVE ${pt.length}B in ${Date.now() - t0} ms (b64 in ${t1 - t0}, native ${t2 - t1}, b64 out ${Date.now() - t2})`);
+            return ab(out);
           } catch (e) {
             console.log('[veil-aes] native encrypt failed, JS fallback:', String(e));
           }
@@ -427,15 +434,20 @@ export const nobleSubtle = {
         if (nat) {
           try {
             const t0 = Date.now();
-            const outB64 = await nat.aesGcmDecrypt(toHexLocal(key.m.key), toHexLocal(iv), toB64(ct), aad ? toHexLocal(aad) : '');
-            console.log(`[veil-aes] decrypt NATIVE ${ct.length}B in ${Date.now() - t0} ms`);
-            return ab(fromB64(outB64));
+            const inB64 = toB64(ct);
+            const t1 = Date.now();
+            const outB64 = await nat.aesGcmDecrypt(toHexLocal(key.m.key), toHexLocal(iv), inB64, aad ? toHexLocal(aad) : '');
+            const t2 = Date.now();
+            const out = fromB64(outB64);
+            console.log(`[veil-aes] decrypt NATIVE ${ct.length}B in ${Date.now() - t0} ms (b64 in ${t1 - t0}, native ${t2 - t1}, b64 out ${Date.now() - t2})`);
+            return ab(out);
           } catch (e) {
             const msg = String(e);
             // VeilCrypto code 20 = GCM authentication failure (wrong key /
             // passphrase / corrupted data). noble would throw the SAME
             // verdict after ~30s of JS — propagate now instead of re-running
             // the whole payload in JS. Only bridge/module errors fall back.
+            console.log(`[veil-aes] native decrypt rejected ${ct.length}B: ${msg.slice(0, 160)}`);
             if (msg.includes('code 20') || msg.includes('authentication failure')) {
               throw new Error('noble-subtle: AES-GCM authentication failed (bad key or data)');
             }

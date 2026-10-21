@@ -37,14 +37,16 @@
  *  - The 8-member cap is untouched: it bounds group MEMBERSHIP (roster),
  *    and listeners are not members of anything on the relay.
  */
-import { GROUP_PROTO, decryptGroupMessage, encryptGroupMessage, saveGroupRecord, loadGroupRecord, groupRecord, senderTag, bumpGroupEnvCount, attestSignature, parseGroupIntro, verifyGroupIntro } from './groups';
+import { GROUP_PROTO, decryptGroupMessage, encryptGroupMessage, saveGroupRecord, loadGroupRecord, groupRecord, senderTag, bumpGroupEnvCount, attestSignature, parseGroupIntro, verifyGroupIntro, GroupRecordConflictError, groupRecordBytes, boundOpenRecord } from './groups';
 import type { GroupRecord } from './groups';
 import { veilIdFromIkPub } from '../../crypto-core/src/identity';
 import { createInviteSession, parseInviteLink } from './invite';
 import { fromB64 } from '../../crypto-core/src/bytes';
 import type { InviteDials } from './invite';
 import { relayTimestampToIso } from './time';
+import { pageBacklog, parseAnchor, type BackfillAnchor } from './backfill';
 import type { GroupSessionDeps, GroupIncomingMedia, GroupInboxEvents } from './group-session';
+import { parseRemoveText, resolveFounderPqKey, sealForumReport, reportSendAvailable, recordReportSend } from './moderation';
 
 export const LOUNGE_DESC_VERSION = 'veil-lounge-1';
 /** b188: FORUM mode — every holder of the join code can read AND write
@@ -60,6 +62,40 @@ export const FORUM_DESC_VERSION = 'veil-forum-1';
 export const FORUM_DESC_VERSION_2 = 'veil-forum-2';
 /** the record key prefix keeps lounge joins discoverable for thread rows */
 export const LOUNGE_TOKEN_PREFIX = 'lounge_';
+
+/** Batch D (D-02/D-04): the forum's identity, shipped in the app so nothing the
+ *  relay serves can say which group is the forum. Null until the owner's forum
+ *  rotation (D-04) sets it; while null the founder's phone marks no group open. */
+export interface ForumPin { groupToken: string; founderVeilId: string; founderIkPubB64: string }
+// D-04 (owner rotation, 18 Oct 2026): the Founding Tester Forum created by the founder
+// Vardum ID EC2oRHsF2uRS98rb on the owner's new phone. The key was read from the relay's
+// identity record and checked to hash to that ID; the group token is the one the founder
+// link names and the relay's row confirms (epoch 1). Changing the forum means a new app build.
+export const FORUM_PIN: ForumPin | null = {
+  // Public copy: the forum's group token is part of its private invite link, so it is
+  // left out here. The shipped app carries the real value.
+  groupToken: '<forum-group-token>',
+  founderVeilId: 'EC2oRHsF2uRS98rb',
+  founderIkPubB64: '7s6X2L4XjIupECm5aGMr8z4ebUsxot7uMANoHoHQOqg=',
+};
+/** Test hook only: tests that build their own forum founders set `pin` to null
+ *  (or another pin). The app never touches it. */
+export const forumPinTestOverride: { pin: ForumPin | null | undefined } = { pin: undefined };
+const activeForumPin = (): ForumPin | null => (forumPinTestOverride.pin !== undefined ? forumPinTestOverride.pin : FORUM_PIN);
+
+/** Batch E (round-3 review F-8): is this the pinned forum's group token? */
+export function isPinnedForumToken(groupToken: string): boolean {
+  const pin = activeForumPin();
+  return !!pin && groupToken === pin.groupToken;
+}
+
+/** Batch E (round-3 review F-2): is this group the pinned forum, and this phone
+ *  the pinned founder (ID AND identity key)? Reports open only when it is. */
+export function isPinnedForumFounder(groupToken: string, myVeilId: string, myIkPubB64: string): boolean {
+  const pin = activeForumPin();
+  return !!pin && groupToken === pin.groupToken && myVeilId === pin.founderVeilId && myIkPubB64 === pin.founderIkPubB64;
+}
+const FORUM_PIN_MISMATCH = 'This forum invitation is not the Vardum forum this app trusts, so it was not opened. Update Vardum, or ask the founder.';
 
 export interface LoungeDescriptor {
   v: string;
@@ -87,7 +123,7 @@ export interface LoungeDescriptor {
 
 /** Validate a hosted lounge descriptor. Throws a user-safe message on any
  *  shape problem — never returns a half-parsed descriptor. */
-export function parseLoungeDescriptor(payload: unknown): LoungeDescriptor {
+export function parseLoungeDescriptor(payload: unknown, pin: ForumPin | null = activeForumPin()): LoungeDescriptor {
   const p = (payload ?? {}) as Record<string, unknown>;
   if (p.v !== LOUNGE_DESC_VERSION && p.v !== FORUM_DESC_VERSION && p.v !== FORUM_DESC_VERSION_2) {
     throw new Error('This lounge invitation is not in a supported format.');
@@ -129,6 +165,17 @@ export function parseLoungeDescriptor(payload: unknown): LoungeDescriptor {
     if (!pqOk) throw new Error('This forum invitation is missing its group key material. Ask the founder to refresh it.');
   }
   if (!Number.isInteger(epoch) || epoch < 1) throw new Error('This lounge invitation has an invalid epoch.');
+  // Batch D (D-04): with the forum pinned in the app, a descriptor naming another
+  // founder (ID or key) or another group is refused here, before any relay call
+  if (pin) {
+    if (founderVeilId !== pin.founderVeilId || founderIkPub !== pin.founderIkPubB64) throw new Error(FORUM_PIN_MISMATCH);
+    if (p.v === FORUM_DESC_VERSION_2) {
+      const linkGroup = parseInviteLink(link).groupToken;
+      if (linkGroup && linkGroup !== pin.groupToken) throw new Error(FORUM_PIN_MISMATCH);
+    } else if (group_token !== pin.groupToken) {
+      throw new Error(FORUM_PIN_MISMATCH);
+    }
+  }
   return {
     v: String(p.v),
     group_token, gek, epoch, link: link || undefined,
@@ -155,10 +202,18 @@ export async function joinLounge(
     descriptor: LoungeDescriptor;
     identity: { veilId: string; ikSeedB64: string; ikPubB64: string };
     nickname?: string;
+    /** Batch D (D-04): defaults to the in-app FORUM_PIN */
+    pin?: ForumPin | null;
   },
 ): Promise<{ threadToken: string; alreadyJoined: boolean; groupToken: string }> {
   const d = opts.descriptor;
+  // Batch D (D-04): the pinned forum only
+  const lpin = opts.pin === undefined ? activeForumPin() : opts.pin;
+  if (lpin && (d.group_token !== lpin.groupToken || d.founder_veil_id !== lpin.founderVeilId || d.founder_ik_pub !== lpin.founderIkPubB64)) throw new Error(FORUM_PIN_MISMATCH);
   const prev = (await loadGroupRecord(deps.storage, d.group_token)) ?? groupRecord(deps.storage, d.group_token);
+  // Batch D (D-01, RV-01): the token came from the relay; never let it land on a
+  // private group this device already holds
+  if (prev && (prev.role === 'creator' || prev.role === 'member')) throw new GroupRecordConflictError();
   const founderTag = await senderTag(d.group_token, d.epoch, d.founder_veil_id);
   const myTag = await senderTag(d.group_token, d.epoch, opts.identity.veilId);
   const rec: GroupRecord = {
@@ -167,6 +222,7 @@ export async function joinLounge(
     ikSeedB64: opts.identity.ikSeedB64,
     ikPubB64: opts.identity.ikPubB64,
     role: 'listener',
+    creatorIkPubB64: d.founder_ik_pub, // b54: only the founder can rekey
     epoch: d.epoch,
     gekB64: d.gek,
     nameGekB64: d.gek,
@@ -209,9 +265,13 @@ async function joinForumInner(
     identity: { veilId: string; ikSeedB64: string; ikPubB64: string };
     clientId: string;
     nickname?: string;
+    /** Batch D (D-04): defaults to the in-app FORUM_PIN (tests pass their own) */
+    pin?: ForumPin | null;
   },
 ): Promise<{ threadToken: string; alreadyJoined: boolean; groupToken: string }> {
   let d = opts.descriptor;
+  const pin = opts.pin === undefined ? activeForumPin() : opts.pin;
+  if (pin && (d.founder_veil_id !== pin.founderVeilId || d.founder_ik_pub !== pin.founderIkPubB64)) throw new Error(FORUM_PIN_MISMATCH);
   if (d.v !== FORUM_DESC_VERSION && d.v !== FORUM_DESC_VERSION_2) throw new Error('This forum invitation is not in a supported format.');
   if (d.v === FORUM_DESC_VERSION_2) {
     // b188-r8 (founder message decrypt repro): forum-2 descriptors carry the
@@ -233,9 +293,16 @@ async function joinForumInner(
     try { pqOk = fromB64(pqPubB64).length >= 800; } catch { pqOk = false; }
     if (!pqOk) throw new Error('This forum is missing its group key material. Ask the founder to refresh it.');
     if (parsed.epoch && parsed.epoch !== rowEpoch) throw new Error('This forum invitation has rotated. Ask the founder for a fresh one.');
+    // Batch D (D-03): a founder link that names its group must match the peek
+    if (parsed.groupToken && parsed.groupToken !== groupToken) throw new Error('This forum invitation does not match its group. Ask the founder to refresh it.');
+    // Batch D (D-04): the relay's answer must be the pinned forum group
+    if (pin && groupToken !== pin.groupToken) throw new Error(FORUM_PIN_MISMATCH);
     d = { ...d, group_token: groupToken, epoch: rowEpoch, gek: parsed.gek ?? d.gek, group_pq_pub: pqPubB64 };
   }
   const prev = (await loadGroupRecord(deps.storage, d.group_token)) ?? groupRecord(deps.storage, d.group_token);
+  // Batch D (D-01, RV-01): the token came from the relay; never let it land on a
+  // private group this device already holds
+  if (prev && (prev.role === 'creator' || prev.role === 'member')) throw new GroupRecordConflictError();
   const founderTag = await senderTag(d.group_token, d.epoch, d.founder_veil_id);
   const myTag = await senderTag(d.group_token, d.epoch, opts.identity.veilId);
 
@@ -316,6 +383,7 @@ async function joinForumInner(
     ikSeedB64: opts.identity.ikSeedB64,
     ikPubB64: opts.identity.ikPubB64,
     role: 'forum-member',
+    creatorIkPubB64: d.founder_ik_pub, // b54: only the founder can rekey
     epoch: d.epoch,
     gekB64: d.gek,
     nameGekB64: d.gek,
@@ -341,6 +409,46 @@ async function joinForumInner(
  *  reuses the existing posting session), so the WHOLE join retries on 429
  *  with exponential backoff + jitter; after the retries the user gets one
  *  honest sentence, never a raw "Rate limit exceeded". */
+/**
+ * Batch C (A1): on the FOUNDER's phone, mark the creator record of the forum
+ * group as open membership. The forum is open by design — anyone holding the
+ * public forum link joins, identities verified through the registry — so the
+ * founder's view keeps trusting the attestation-verified roster there, while
+ * every other group the founder created stays creator-authorised (seat proofs).
+ * Only acts when the descriptor names THIS identity as founder (by Vardum ID
+ * and key) and this device holds the creator record of the linked group.
+ *
+ * Batch D (D-02, RV-02): the forum group is no longer resolved from anything the
+ * relay serves (the descriptor's token, or a peek). It must be the group pinned
+ * in the app (FORUM_PIN), and a group that already admitted anyone through a
+ * seat proof is never opened. (Unused seats are allowed:
+ * the forum's founder link is itself a seat link.) Until the pin is set (D-04)
+ * nothing is marked.
+ */
+export async function markForumGroupIfFounder(
+  deps: Pick<GroupSessionDeps, 'relay' | 'storage'>,
+  opts: { descriptor: LoungeDescriptor; identity: { veilId: string; ikPubB64: string } },
+  pin: ForumPin | null = activeForumPin(),
+): Promise<string | null> {
+  const d = opts.descriptor;
+  if (!pin) return null;
+  if (d.founder_veil_id !== opts.identity.veilId || d.founder_ik_pub !== opts.identity.ikPubB64) return null;
+  if (pin.founderVeilId !== opts.identity.veilId || pin.founderIkPubB64 !== opts.identity.ikPubB64) return null;
+  const groupToken = pin.groupToken;
+  const rec = (await loadGroupRecord(deps.storage, groupToken)) ?? groupRecord(deps.storage, groupToken);
+  if (!rec || rec.role !== 'creator' || rec.ikPubB64 !== opts.identity.ikPubB64) return null;
+  // (a member list the founder phone signed before it had the pin admits nobody,
+  // so only a real admission counts — owner rotation, 18 Oct)
+  const hasPrivateMembership = Object.keys(rec.admitted ?? {}).length > 0;
+  if (hasPrivateMembership && !rec.openMembership) return null;
+  if (!rec.openMembership) {
+    rec.openMembership = true;
+    await saveGroupRecord(deps.storage, rec);
+    console.log('[veil-forum] founder record marked as the open forum group', { groupToken: groupToken.slice(0, 6) });
+  }
+  return groupToken;
+}
+
 export async function joinForum(
   deps: Parameters<typeof joinForumInner>[0],
   opts: Parameters<typeof joinForumInner>[1],
@@ -387,7 +495,7 @@ async function withBackoff429<T>(label: string, fn: () => Promise<T>): Promise<T
  */
 export async function sendForumMessage(
   deps: GroupSessionDeps,
-  opts: { groupToken: string; clientId: string; text: string; cover?: boolean },
+  opts: { groupToken: string; clientId: string; text: string; cover?: boolean; /** reports: no notify request */ silent?: boolean },
 ): Promise<{ senderTag: string }> {
   const rec = (await loadGroupRecord(deps.storage, opts.groupToken)) ?? groupRecord(deps.storage, opts.groupToken);
   if (!rec || rec.role !== 'forum-member' || !rec.postingSessionToken) {
@@ -453,7 +561,49 @@ export async function sendForumMessage(
   if (submitRes && typeof submitRes === 'object' && 'status' in submitRes && Number((submitRes as { status: number }).status) >= 400) {
     throw new Error('The forum is briefly unavailable — try again in a moment.');
   }
+  // b199 (owner decision, Oct 17): a real post asks the relay to ping the
+  // forum; the RELAY only honours it for the founder's posts (tester posts
+  // stay silent, and a modified app can't use this to spam the cohort).
+  if (!opts.cover && !opts.silent) {
+    void deps.relay.invoke('veilGroupGate', {
+      action: 'notify',
+      group_token: opts.groupToken,
+      session_token: rec.postingSessionToken as string,
+      write_secret: (sealed as { writeSecret?: string }).writeSecret ?? null,
+    }).then((r) => {
+      const d = (r as { data?: { data?: { pinged?: number }; skipped?: string; coalesced?: boolean } } | null)?.data;
+      console.log(`[veil-forum] notify → ${d?.skipped ? 'not sent (' + d.skipped + ')' : d?.coalesced ? 'coalesced' : 'pinged ' + (d?.data?.pinged ?? '?') + ' device(s)'}`);
+    }).catch(() => undefined);
+  }
   return { senderTag: env.senderTag };
+}
+
+/**
+ * Play UGC (18 Oct 2026): report a forum post to the founder. The report is
+ * sealed to the founder's PQ prekey (verified under the pinned founder key —
+ * see moderation.ts) and posted silently through the reporter's own posting
+ * session. The relay holds the forum key, so it can see that the post is a
+ * report (and who sent it); only the founder's phone can read what it says.
+ * (Corrected in Batch H, R6-2-09: this said "one more opaque forum post".)
+ */
+export async function sendForumReport(
+  deps: GroupSessionDeps,
+  opts: { groupToken: string; clientId: string; post: { envelopeId: string; senderVeilId: string | null; text: string }; reason?: string; pin?: ForumPin | null },
+): Promise<void> {
+  const pin = opts.pin === undefined ? activeForumPin() : opts.pin;
+  const rec = (await loadGroupRecord(deps.storage, opts.groupToken)) ?? groupRecord(deps.storage, opts.groupToken);
+  if (!rec || rec.role !== 'forum-member' || !rec.creatorIkPubB64) throw new Error('This forum thread is not joined on this device.');
+  const founder = pin ?? { founderVeilId: await veilIdFromIkPub(rec.creatorIkPubB64), founderIkPubB64: rec.creatorIkPubB64 };
+  if (founder.founderIkPubB64 !== rec.creatorIkPubB64) throw new Error(FORUM_PIN_MISMATCH);
+  // Batch F (agent-01 round 4): a send cap on this phone
+  if (!(await reportSendAvailable(deps.storage))) throw new Error('You can send up to 3 reports a day. Try again tomorrow, or block the sender now.');
+  const pq = await resolveFounderPqKey(deps.relay as never, founder);
+  const text = await sealForumReport(pq, founder.founderVeilId, opts.groupToken, {
+    postId: opts.post.envelopeId, authorVeilId: opts.post.senderVeilId ?? '',
+    excerpt: opts.post.text, reason: (opts.reason ?? '').trim(), at: new Date().toISOString(),
+  });
+  await sendForumMessage(deps, { groupToken: opts.groupToken, clientId: opts.clientId, text, silent: true });
+  await recordReportSend(deps.storage).catch(() => undefined); // Batch G (R5-2-10): only a sent report spends a slot
 }
 
 export interface LoungeInboxResult {
@@ -474,12 +624,19 @@ export interface LoungeInboxResult {
  */
 export async function pollLoungeInbox(
   deps: GroupSessionDeps,
-  opts: { groupToken: string; knownIds: Set<string>; events: Pick<GroupInboxEvents, 'onMessage' | 'onSystem' | 'onSenderVerifyFailed'> },
+  opts: { groupToken: string; knownIds: Set<string>; events: Pick<GroupInboxEvents, 'onMessage' | 'onSystem' | 'onSenderVerifyFailed'> & {
+    /** the founder removed these posts for everyone — drop them from the thread */
+    onRemove?: (envelopeIds: string[]) => void;
+  } },
 ): Promise<LoungeInboxResult | null> {
   const rec = (await loadGroupRecord(deps.storage, opts.groupToken)) ?? groupRecord(deps.storage, opts.groupToken);
   if (!rec || (rec.role !== 'listener' && rec.role !== 'forum-member')) return null;
-  const founderTag = Object.keys(rec.senderKeys ?? {})[0] ?? '';
-  if (!founderTag) return null;
+  // Batch C (B6/F-8): the founder tag is derived from the founder key this
+  // record pinned at join — not "the first key in senderKeys", which now also
+  // holds persisted forum member keys
+  if (!rec.creatorIkPubB64) return null;
+  const founderTag = await senderTag(opts.groupToken, rec.epoch, await veilIdFromIkPub(rec.creatorIkPubB64));
+  if (!rec.senderKeys?.[founderTag]) return null;
   const founderNick = rec.nicks?.[founderTag] ?? 'Founder';
 
   // b195-r1: the client entity API exposes NO range filtering (probed live
@@ -492,33 +649,53 @@ export async function pollLoungeInbox(
   // at the newest row (stable against expired-row deletion, which only
   // happens at the old/deep end), the depth is re-derived each pass from
   // knownEnvIds (never persisted as an offset), and steady state fetches
-  // only the newest 50-row page. Backfill converges at up to 200 rows/pass.
+  // only the newest 50-row page.
+  // R1 (audit doc 13): the fixed 4-page cap never reached a backlog deeper
+  // than one pass ("converges at 200 rows/pass" did not hold), and decrypting
+  // the newest rows first would lose older ones anyway (the replay guard keeps
+  // only 64 skipped counters per sender). The pager (backfill.ts) now walks
+  // to the processed boundary or the thread's end, resuming at a row anchor
+  // kept in the group record when that takes more than one pass; the loop
+  // below stops after LOUNGE_BUDGET definitive outcomes, oldest-first.
   const LOUNGE_PAGE = 50;
-  const LOUNGE_MAX_PAGES = 4;
+  const LOUNGE_FETCH_PAGES = 10;
+  const LOUNGE_BUDGET = 200;
   const knownAtStart = new Set<string>(rec.knownEnvIds ?? []);
-  const pages: Record<string, unknown>[][] = [];
-  for (let page = 0; page < LOUNGE_MAX_PAGES; page++) {
-    const envRaw = await withBackoff429('inbox-poll', () => deps.relay.entityList('VeilEnvelope', {
-      group_token: opts.groupToken, sort: '-created_date', limit: LOUNGE_PAGE, skip: page * LOUNGE_PAGE,
-    }));
-    const ed = envRaw as unknown[] | { data?: unknown[] };
-    const pageRows = (Array.isArray(ed) ? ed : ed.data ?? []).map((r) => (r ?? {}) as Record<string, unknown>);
-    if (!pageRows.length) break; // thread empty or fully paged past the tail
-    pages.push(pageRows);
-    const oldestId = String(pageRows[pageRows.length - 1]?.id ?? '');
-    // this page's oldest row already definitively processed → the history
-    // above it is merged; a short page is the thread's end — stop either way
-    if (pageRows.length < LOUNGE_PAGE || (oldestId && knownAtStart.has(oldestId))) break;
-  }
-  const envelopes = pages.flat().reverse(); // deep-collected, then oldest-first
+  const anchorRec = rec as GroupRecord & { backfillAnchor?: BackfillAnchor | null };
+  const backlog = await pageBacklog({
+    fetchPage: async (skip, limit) => {
+      const envRaw = await withBackoff429('inbox-poll', () => deps.relay.entityList('VeilEnvelope', {
+        group_token: opts.groupToken, sort: '-created_date', limit, skip,
+      }));
+      const ed = envRaw as unknown[] | { data?: unknown[] };
+      return (Array.isArray(ed) ? ed : ed.data ?? []).map((r) => (r ?? {}) as Record<string, unknown>);
+    },
+    isKnown: (id) => knownAtStart.has(id) || opts.knownIds.has(id),
+    pageSize: LOUNGE_PAGE,
+    maxPages: LOUNGE_FETCH_PAGES,
+    anchor: parseAnchor(anchorRec.backfillAnchor),
+  });
+  // persisted with the record save at the end of the pass
+  if (backlog.anchor) anchorRec.backfillAnchor = backlog.anchor;
+  else delete anchorRec.backfillAnchor;
+  if (backlog.anchor) console.log(`[veil-forum] backlog deeper than ${backlog.pages} page(s) — still descending, nothing decrypted this pass`);
+  const envelopes = backlog.rows; // oldest-first, unprocessed only
 
   const persistedKnown = new Set<string>(rec.knownEnvIds ?? []);
-  const markKnown = (id: string): void => { opts.knownIds.add(id); persistedKnown.add(id); };
+  let storageRefused = false; // Batch H (R6-2-01)
+  let decided = 0;
+  const markKnown = (id: string): void => { opts.knownIds.add(id); persistedKnown.add(id); decided++; };
   let founderVerified = false;
+  const removed = new Set<string>(rec.removedEnvIds ?? []);
 
   for (const env of envelopes) {
+    // R1: per-pass budget counts definitive outcomes only, so rows that stay
+    // retryable can't starve the newer ones behind them
+    if (decided >= LOUNGE_BUDGET) break;
     const id = String(env.id ?? '');
     if (!id || opts.knownIds.has(id) || persistedKnown.has(id)) continue;
+    // Play UGC: a post the founder removed is never shown, even if its copy is still on the relay
+    if (removed.has(id)) { markKnown(id); continue; }
     const expiresAt = env.expires_at ? String(env.expires_at) : null;
     if (expiresAt && new Date(expiresAt).getTime() < Date.now()) continue;
     const headerStr = String(env.header ?? '');
@@ -592,6 +769,8 @@ export async function pollLoungeInbox(
         }
         rec.senderKeys = { ...(rec.senderKeys ?? {}), [header.sid]: ikPub };
         rec.nicks = { ...(rec.nicks ?? {}), [header.sid]: vid.slice(0, 8) };
+        // Batch C (F-8): persist the resolved key now, not only at the end of the pass
+        try { await saveGroupRecord(deps.storage, rec); } catch { /* re-resolved next pass */ }
       }
     }
     let out;
@@ -612,7 +791,7 @@ export async function pollLoungeInbox(
       continue; // transient — retryable, same rule as the member path
     }
     if (!out.senderVerified) {
-      // decryptGroupMessage only verifies when a sig is present; the lounge
+      // decryptGroupMessage verifies only senders with a pinned key; the lounge
       // contract requires it. Unsigned founder-tag envelopes are forgeries.
       console.error('[veil-lounge] unsigned founder envelope discarded', { envelopeId: id });
       opts.events.onSenderVerifyFailed(id);
@@ -621,7 +800,9 @@ export async function pollLoungeInbox(
     }
     founderVerified = true;
     markKnown(id);
-    await bumpGroupEnvCount(deps.storage, opts.groupToken);
+    // Batch H (round-6 review R6-2-01): members get the same once-per-pass note as the founder
+    if (out.stateNotSaved) storageRefused = true;
+    await bumpGroupEnvCount(deps.storage, opts.groupToken).catch(() => undefined); // Batch E (N3-5)
     if (out.cover) continue; // founder cover traffic — consumed, never rendered
 
     // b196-r6: PROTOCOL CONTROL MESSAGES NEVER RENDER AS BUBBLES. The forum is
@@ -634,15 +815,36 @@ export async function pollLoungeInbox(
     // and surfaced as a system line; a forged/malformed intro is dropped.
     // Both are already markKnown()'d above, so they are never re-processed.
     if (out.text.startsWith('{"__veil_receipt":')) continue;
+    // Play UGC: "remove for everyone" counts only from the founder's tag (whose
+    // signature was required above); anyone else's is consumed and ignored
+    const removeIds = parseRemoveText(out.text);
+    if (removeIds) {
+      if (header.sid === founderTag && removeIds.length) {
+        for (const r of removeIds) removed.add(r);
+        rec.removedEnvIds = Array.from(removed).slice(-500);
+        opts.events.onRemove?.(removeIds);
+      } else if (header.sid !== founderTag) {
+        console.error('[veil-forum] removal from a non-founder ignored', { envelopeId: id });
+      }
+      continue;
+    }
     if (out.text.startsWith('{"__veil_intro":')) {
       try {
         const parsedIntro = parseGroupIntro(out.text);
         const intro = parsedIntro ? await verifyGroupIntro(parsedIntro) : null;
-        if (intro) {
-          if (intro.nick) { rec.nicks = { ...(rec.nicks ?? {}), [String(header.sid)]: intro.nick }; }
+        // Batch C (B6): the intro must be signed by the key this sender tag
+        // verified under; only the founder's tag may carry the founder's name
+        const introSid = String(header.sid);
+        const introMatches = !!intro && intro.ikPub === rec.senderKeys?.[introSid]
+          && (introSid === founderTag ? intro.ikPub === rec.creatorIkPubB64 : intro.veilId === (header as { vid?: string }).vid);
+        const nickAllowed = !!intro && (introSid === founderTag
+          || (intro.nick.trim().toLowerCase() !== founderNick.trim().toLowerCase() && !/^founder\b/i.test(intro.nick.trim())));
+        if (intro && !introMatches) console.error('[veil-forum] intro does not match its sender — dropped', { envelopeId: id });
+        if (intro && introMatches) {
+          if (intro.nick && nickAllowed) { rec.nicks = { ...(rec.nicks ?? {}), [introSid]: intro.nick }; }
           opts.events.onSystem({
             envelopeId: id,
-            note: `${intro.nick || intro.veilId.slice(0, 8)} joined the forum`,
+            note: `${(nickAllowed && intro.nick) || intro.veilId.slice(0, 8)} joined the forum`,
             sentAt: relayTimestampToIso(env.created_date as string | undefined),
           });
         }
@@ -690,7 +892,12 @@ export async function pollLoungeInbox(
   // knownEnvIds is both the dedupe set and the backfill-depth signal. Rows
   // with retryable outcomes simply stay unmarked here, so the descending
   // pager keeps reaching them on the next pass.
-  rec.knownEnvIds = Array.from(persistedKnown).slice(-1000);
-  try { await saveGroupRecord(deps.storage, rec); } catch { /* best-effort, same as member path */ }
+  // Batch H (R6-2-01): the same 300-id bound as the founder's path, the forum
+  // record bounded, its size logged, and a refused save said once
+  rec.knownEnvIds = Array.from(persistedKnown).slice(-300);
+  boundOpenRecord(rec, Date.now(), founderTag);
+  if (groupRecordBytes(rec) > 40_000) console.log('[veil-lounge] large forum record', { bytes: groupRecordBytes(rec) });
+  try { await saveGroupRecord(deps.storage, rec); } catch { storageRefused = true; }
+  if (storageRefused) opts.events.onSystem({ envelopeId: `storage_${opts.groupToken}`, note: 'This phone’s storage refused to save the forum’s state. Messages still open, but some of it is only kept until the app closes. Free up space, then reopen the forum.', sentAt: new Date().toISOString() });
   return { founderVerified, founderNick };
 }

@@ -14,6 +14,9 @@ import { toB64 } from '../vendor/crypto-core/src/index';
 // b198 RELAY FLIP (founder-approved): self-hosted relay behind Caddy TLS.
 // Base44 remains the production/TestFlight relay until the staged cutover completes.
 export const VEIL_BASE_URL = 'https://relay.tryveil.app';
+// b199 (Oct 16): the public website, for Settings' privacy policy, terms and
+// Security Centre links. They pointed at the relay, which has no web pages.
+export const VEIL_SITE_URL = 'https://tryveil.app';
 export let VEIL_APP_ID = '6a9dae3b8bc7a581e4ab310a';
 export const setVeilAppId = (id: string) => { VEIL_APP_ID = id; };
 

@@ -11,7 +11,7 @@
  * in @veil/crypto-core before anything reaches this client.
  */
 
-export const RATCHET_PROTOCOL = 'veil-ratchet-4'; // spec §4 wire tag; sessions carry their own proto
+export const RATCHET_PROTOCOL = 'veil-ratchet-6'; // spec §4 wire tag (b54); sessions carry their own proto
 export const GROUP_PROTOCOL = 'veil-group-1';
 
 export interface RelayConfig {
@@ -37,7 +37,9 @@ export interface RelayConfig {
 
 export interface EnvelopeSubmission {
   session_token: string;
-  client_id: string;
+  /** Batch D (D-12, RV-48): accepted from callers but never sent — the relay
+   *  doesn't need the account's client id on an envelope (V-13) */
+  client_id?: string;
   write_secret: string | null;
   sender_client_id: string;
   ciphertext: string;
@@ -146,7 +148,12 @@ export class VeilRelay {
       // unchanged.
       const isExpectedHeartbeatMiss = action === 'heartbeat' && /session not found/i.test(msg);
       const isExpectedSendMiss = fn === 'submitEnvelope' && /session (not found|is not available)/i.test(msg);
-      if (isExpectedActivateRejection) {
+      // TURN credentials: the caller (CallManager turnIce) falls back to
+      // host-only and logs its own line — not an error worth a red LogBox.
+      const isTurnFallback = fn === 'veilTurnCredentials';
+      if (isTurnFallback) {
+        console.log(`[veil-relay] ${fn} unavailable — HTTP ${res.status}`);
+      } else if (isExpectedActivateRejection) {
         console.log(`[veil-relay] ${fn}(activate) skipped — expected rejection for this session's type/role (${msg})`);
       } else if (isExpectedBurnMiss) {
         console.log(`[veil-relay] ${fn}(burn) skipped — envelope already gone (${msg})`);
@@ -258,7 +265,7 @@ export class VeilRelay {
 
   // ---------- identity gate (public keys only — never private material) ----------
 
-  identityRegister(material: { veil_id: string; IK_pub: string; SPK_pub: string; SPK_sig: string; pq_pub: string }) {
+  identityRegister(material: { veil_id: string; IK_pub: string; SPK_pub: string; SPK_sig: string; pq_pub: string; pq_sig: string }) {
     return this.invoke('veilIdentityGate', { action: 'register', ...material });
   }
 
@@ -292,12 +299,28 @@ export class VeilRelay {
     responder_ratchet_pub_jwk: string;
     responder_pq_ct: string;
     fingerprint: string;
+    /** Batch C (V-16): replace the link's responder credential at join */
+    new_responder_write_hash?: string;
   }) {
     return this.invoke('veilSessionGate', { action: 'join', ...join });
   }
 
-  sessionList(clientId: string, veilId?: string) {
-    return this.invoke('veilSessionGate', { action: 'list', client_id: clientId, ...(veilId ? { veil_id: veilId } : {}) });
+  /** Batch F (round-4 reviews R4-3-02 / R4-4-21): rows that only name the caller
+   *  (contact requests, restore matches) come in pages of 100; follow
+   *  naming_next_cursor (at most 10 more pages) and return one merged list. */
+  async sessionList(clientId: string, veilId?: string) {
+    const first = await this.invoke('veilSessionGate', { action: 'list', client_id: clientId, ...(veilId ? { veil_id: veilId } : {}) });
+    const d = first.data as { sessions?: unknown[]; naming_next_cursor?: string | null } | null;
+    let next = d?.naming_next_cursor ?? null;
+    if (!next || !Array.isArray(d?.sessions)) return first;
+    const merged = [...(d!.sessions as unknown[])];
+    for (let guard = 0; next && guard < 10; guard++) {
+      const pg = await this.invoke('veilSessionGate', { action: 'list', client_id: clientId, ...(veilId ? { veil_id: veilId } : {}), naming_cursor: next });
+      const pd = pg.data as { sessions?: unknown[]; naming_next_cursor?: string | null } | null;
+      if (Array.isArray(pd?.sessions)) merged.push(...pd!.sessions);
+      next = pd?.naming_next_cursor ?? null;
+    }
+    return { data: { ...d, sessions: merged, naming_next_cursor: null }, status: first.status };
   }
 
   sessionPeek(token: string, writeSecret: string | null) {
@@ -500,7 +523,6 @@ export class VeilRelay {
   async submitEnvelope(sub: EnvelopeSubmission): Promise<{ data: unknown; status: number }> {
     const payload = {
       session_token: sub.session_token,
-      client_id: sub.client_id,
       write_secret: sub.write_secret,
       sender_client_id: sub.sender_client_id,
       ciphertext: sub.ciphertext,

@@ -20,7 +20,13 @@ const fromHex = (h: string): Uint8Array =>
   new Uint8Array(h.match(/.{2}/g)!.map((b) => parseInt(b, 16)));
 
 export const VAULT_PBKDF2_ITERATIONS = 600000;
-export const VAULT_KDF_LABEL = 'PBKDF2-SHA256-600000';
+/** Batch C (A4a): new vaults use container format v2 (no plaintext slot length). */
+export const VAULT_KDF_LABEL = 'PBKDF2-SHA256-600000/v2';
+/** pre-Batch-C vaults (format v1) — still readable */
+export const VAULT_KDF_LABEL_V1 = 'PBKDF2-SHA256-600000';
+/** Batch C (A4c): PBKDF2 bounds accepted anywhere in the app */
+export const PBKDF2_MIN_ITERATIONS = 100_000;
+export const PBKDF2_MAX_ITERATIONS = 1_000_000;
 
 type NativeVeilCrypto = { pbkdf2Sha256(password: string, saltHex: string, iterations: number, dkLen: number): Promise<string> };
 
@@ -63,6 +69,13 @@ export async function pbkdf2Sha256Bytes(
   iterations: number,
   dkLen = 32,
 ): Promise<Uint8Array> {
+  // Batch C (A4c; review P3 R7): the iteration count can come from a relay
+  // record — bound it before it reaches native or JS code (no 1-iteration
+  // downgrade, no multi-hour hang). Every caller lives on this one entry point.
+  if (!Number.isInteger(iterations) || iterations < PBKDF2_MIN_ITERATIONS || iterations > PBKDF2_MAX_ITERATIONS) {
+    throw new Error('Unsupported key-derivation setting.');
+  }
+  if (!Number.isInteger(dkLen) || dkLen < 16 || dkLen > 64) throw new Error('Unsupported key-derivation setting.');
   const native = getNativeCrypto();
   if (native) {
     const t0 = Date.now();

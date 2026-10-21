@@ -62,6 +62,27 @@ export async function bip39Seed(words: string[]): Promise<Uint8Array> {
   return new Uint8Array(bits);
 }
 
+/**
+ * veil-ratchet-6 session fingerprint over the full handshake transcript:
+ *   SHA-256( lp(label) || lp(field_1) || ... || lp(field_n) )
+ * where lp(x) = 4-byte big-endian length || x. Every public handshake value
+ * (both session DH pubs, the PQ public key and ciphertext, token, version) and
+ * SHA-256(shared) are bound, so any substitution or downgrade by the relay
+ * changes the value both users compare. Rendered like sessionFingerprint.
+ */
+export async function transcriptFingerprint(label: string, fields: Uint8Array[]): Promise<string> {
+  const parts = [utf8(label), ...fields];
+  const total = parts.reduce((n, p) => n + 4 + p.length, 0);
+  const buf = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    new DataView(buf.buffer).setUint32(off, p.length);
+    buf.set(p, off + 4);
+    off += 4 + p.length;
+  }
+  return sessionFingerprint(buf);
+}
+
 /** Session fingerprint: D456-4641-... style (pb() in the bundle). */
 export async function sessionFingerprint(secret: Uint8Array): Promise<string> {
   const h = await sha256(secret);

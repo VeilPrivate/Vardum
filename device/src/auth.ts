@@ -187,7 +187,7 @@ export class Base44Auth {
     });
     const data = await res.json().catch(() => null);
     if (!res.ok) {
-      const msg = (data as { message?: string } | null)?.message || `Veil could not reach the relay — nothing was deleted. Try again in a moment.`;
+      const msg = (data as { message?: string } | null)?.message || `Vardum could not reach the relay — nothing was deleted. Try again in a moment.`;
       throw new Error(msg);
     }
     return (data as { data?: Record<string, unknown> } | null)?.data ?? {};

@@ -1,7 +1,7 @@
 /**
  * VEIL CallOverlay (b144, W3): full-screen call surface — ring out, ring in,
  * active call with the local-only integrity dot, and the ended card.
- * VEIL palette per the standing design rules (#101920 card, #7cf4c8 accent,
+ * Vardum palette (#15151B card, #FFFFFF accent; teal only for the V,
  * no raw error text — CallRefused reasons are surfaced verbatim from the
  * calls.ts guard rails, which never carry diagnostics).
  */
@@ -9,10 +9,10 @@ import React, { useEffect, useState } from 'react';
 import { Modal, View, Text, TouchableOpacity, StyleSheet, Vibration } from 'react-native';
 import { CallManager, type CallSnapshot } from '../calls/CallManager';
 
-const CARD = '#101920';
-const ACCENT = '#7cf4c8';
-const INK = '#e8f4f0';
-const MUTED = '#7f9a92';
+const CARD = '#15151B';
+const ACCENT = '#FFFFFF';
+const INK = '#FFFFFF';
+const MUTED = '#8E9696';
 
 function fmtDur(ms: number): string {
   const t = Math.max(0, Math.floor(ms / 1000));
@@ -22,7 +22,8 @@ function fmtDur(ms: number): string {
 }
 
 function phaseLine(s: CallSnapshot, dur: string): string {
-  if (s.phase === 'calling') return 'Ringing…';
+  // 21 Oct 2026: 'Ringing…' only once the other phone confirms it rings
+  if (s.phase === 'calling') return s.reach === 'ringing' ? 'Ringing…' : s.reach === 'unreachable' ? 'Not reachable yet. Still trying…' : 'Calling…';
   if (s.phase === 'ringing') return 'Incoming call';
   // b151: signaling finished but the real media path hasn't connected yet —
   // say so, instead of jumping straight to a running timer.
@@ -62,7 +63,7 @@ export function CallOverlay() {
             <View style={[styles.arc, { width: 60, height: 60, opacity: 0.55 }]} />
             <View style={[styles.arc, { width: 38, height: 38, opacity: 0.8 }]} />
           </View>
-          <Text style={styles.wordmark}>VEIL CALL</Text>
+          <Text style={styles.wordmark}><Text style={{ color: '#20D9C2' }}>V</Text>ardum call</Text>
           <Text style={styles.peer} numberOfLines={1}>{snap.peerLabel}</Text>
           <Text style={[styles.phase, snap.integrity === 'red' ? styles.phaseRed : null]}>
             {phaseLine(snap, dur)}
@@ -112,11 +113,11 @@ export function CallOverlay() {
 }
 
 const styles = StyleSheet.create({
-  wrap: { flex: 1, backgroundColor: '#060d0b' },
+  wrap: { flex: 1, backgroundColor: '#0B0B0F' },
   card: { flex: 1, backgroundColor: CARD, alignItems: 'center', justifyContent: 'center', padding: 28 },
   arcs: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', marginBottom: 10 },
   arc: { borderRadius: 999, borderWidth: 2, borderColor: ACCENT, marginRight: -18 },
-  wordmark: { color: ACCENT, fontSize: 13, letterSpacing: 6, fontWeight: '700', marginBottom: 18 },
+  wordmark: { color: INK, fontSize: 15, fontFamily: 'Menlo', fontWeight: '600', letterSpacing: 0.5, marginBottom: 18 },
   peer: { color: INK, fontSize: 26, fontWeight: '600', marginBottom: 6 },
   phase: { color: MUTED, fontSize: 15, marginBottom: 22 },
   phaseRed: { color: '#ff6b6b', fontWeight: '600' },
@@ -131,8 +132,8 @@ const styles = StyleSheet.create({
   btn: { paddingHorizontal: 34, paddingVertical: 15, borderRadius: 14, borderWidth: 1, borderColor: ACCENT },
   btnTxt: { color: INK, fontSize: 15, fontWeight: '600' },
   answerBtn: { backgroundColor: ACCENT, borderColor: ACCENT },
-  answerTxt: { color: CARD, fontSize: 15, fontWeight: '700' },
+  answerTxt: { color: '#0B0B0F', fontSize: 15, fontWeight: '700' },
   declineBtn: { borderColor: '#ff6b6b' },
   endBtn: { borderColor: '#ff6b6b' },
-  muteOnBtn: { backgroundColor: 'rgba(124,244,200,0.18)' },
+  muteOnBtn: { backgroundColor: 'rgba(255,255,255,0.18)' },
 });

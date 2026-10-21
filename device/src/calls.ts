@@ -24,6 +24,7 @@
 
 import { toB64, fromB64, randomBytes, senderPseudonym } from '../../crypto-core/src/index';
 import { serializeRatchetSend } from './send-queue';
+import { saveOrThrow } from './save-strict';
 
 export const CALL_CONTROL_TAG = '__veil_call';
 
@@ -110,7 +111,7 @@ export class CallFrameCrypto {
 // L1 — call signaling payloads (ride the existing ratchet envelopes)
 // ---------------------------------------------------------------------------
 
-export type CallSignalOp = 'offer' | 'answer' | 'ice' | 'end';
+export type CallSignalOp = 'offer' | 'answer' | 'ice' | 'end' | 'ringing'; // 'ringing' (21 Oct 2026): the callee confirms the call reached its screen
 
 export interface CallSignal {
   __veil_call: 1;
@@ -124,6 +125,9 @@ export interface CallSignal {
   k?: string;
   /** op=ice: one ICE candidate, as serialized by WebRTC */
   cand?: string;
+  /** op=ice (20 Oct 2026): a batch of candidates; `cand` still holds the first,
+   *  so a build that predates batching reads at least that one */
+  cands?: string[];
   /** op=end: 'hangup' | 'busy' | 'missed' | 'refused' */
   reason?: string;
   /** monotonic attempt number — replays of an OLD offer for the same
@@ -140,7 +144,7 @@ export function parseCallSignal(text: string): CallSignal | null {
   try {
     const t = JSON.parse(text) as CallSignal;
     if (t.__veil_call !== 1 || typeof t.call_id !== 'string') return null;
-    if (!['offer', 'answer', 'ice', 'end'].includes(t.op)) return null;
+    if (!['offer', 'answer', 'ice', 'end', 'ringing'].includes(t.op)) return null;
     return t;
   } catch { return null; }
 }
@@ -332,6 +336,9 @@ async function sendCallSignalUnlocked(
   const state = await deserializeState(sealed);
   const body = JSON.stringify({ ...sig, __veil_call: 1 as const });
   const env = await encrypt(state, body);
+  // Batch H (round-6 review R6-1-06): persist BEFORE send (a refused save stops the
+  // signal; a step is never sent twice). b143: keep the loaded record's extras.
+  await saveOrThrow(sessions, token, { ...(sealed as Record<string, unknown>), ...(await serializeState(state) as Record<string, unknown>) });
   const r = await relay.submitEnvelope({
     session_token: token,
     client_id: clientId,
@@ -346,7 +353,7 @@ async function sendCallSignalUnlocked(
     header: env.header,
     byte_length: env.byteLength ?? env.ciphertext.length,
     ttl_seconds: 300, // call setup is latency-bound; stale offers must die fast
-    protocolVersion: sealed.proto ?? 'veil-ratchet-4',
+    protocolVersion: sealed.proto ?? 'veil-ratchet-6',
   });
   const d = r.data as { status?: string; error?: string };
   if (d && typeof d === 'object' && d.status && String(d.status).toLowerCase() !== 'ok') {
@@ -360,11 +367,6 @@ async function sendCallSignalUnlocked(
   if (sig.op === 'offer') {
     void relay.invoke?.('veilSessionGate', { action: 'notify', token, write_secret: sealed.writeSecret ?? null, call: true }).catch(() => undefined);
   }
-  // b143 FIX: the resealed state must keep the loaded record's EXTRAS
-  // (writeSecret, expire dials, burn flags, proto) — saving the bare
-  // serialized ratchet state dropped writeSecret and the next chat send
-  // on this thread failed with no write secret. Same discipline as
-  // sendChatMessage's withExtras; spread order keeps new ratchet fields
-  // authoritative while non-ratchet fields survive.
-  await sessions.save(token, { ...(sealed as Record<string, unknown>), ...(await serializeState(state) as Record<string, unknown>) });
+  // b143 FIX (the save above): the resealed state keeps the loaded record's EXTRAS
+  // (writeSecret, expire dials, burn flags, proto), as sendChatMessage's withExtras.
 }

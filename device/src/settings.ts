@@ -22,9 +22,9 @@ export interface VeilSettings {
   storageMode: 'device' | 'hardware' | 'memory';
   /** Hold until unlock — delivery held while the phone is locked */
   holdUntilUnlock: boolean;
-  /** Self-destruct countdown — everything on-device wipes on a fixed 48-hour clock */
+  /** Self-destruct countdown — everything on-device wipes on a fixed 14-day clock */
   selfDestruct: boolean;
-  /** epoch ms when the 48h clock was armed (0 = not armed); never reset by messaging */
+  /** epoch ms when the 14-day clock was armed (0 = not armed); never reset by messaging */
   selfDestructArmedAt: number;
   /** Read receipts */
   readReceipts: boolean;
@@ -32,6 +32,9 @@ export interface VeilSettings {
   nickname: string;
   /** checkup completed */
   setupDone: boolean;
+  /** (b199) a NEW sign-up has not finished the required onboarding
+   *  (intro → checkup → passcode) yet — boot resumes it instead of the app */
+  onboardingPending: boolean;
   /** (b139 funnel fix) first REAL relay session opened — the "Secure your VEIL"
    *  prompt waits until after this, never before (onboarding-funnel-fix-spec) */
   firstSessionDone: boolean;
@@ -47,15 +50,28 @@ export interface VeilSettings {
 /** Auto-lock is NOT a dial: a fixed 1-minute inactivity rule, always on. */
 export const AUTO_LOCK_MINUTES = 1;
 
-/** Self-destruct clock: fixed 48 h, warning 12 h before, extend adds 48 h. */
-export const SELF_DESTRUCT_HOURS = 48;
-export const SELF_DESTRUCT_WARN_HOURS = 36;
+/** Self-destruct clock: fixed 14 days, warning 12 h before, extend adds 14 days.
+ *  b199 (owner, Oct 16 2026): was 48 h. Already-armed clocks keep their start
+ *  time, so they simply run longer. */
+export const SELF_DESTRUCT_DAYS = 14;
+export const SELF_DESTRUCT_HOURS = SELF_DESTRUCT_DAYS * 24;
+export const SELF_DESTRUCT_WARN_HOURS = SELF_DESTRUCT_HOURS - 12;
+
+/** "9 days" while two days or more remain, then "30 hours" / "1 hour". */
+export function selfDestructLeftLabel(hoursLeft: number): string {
+  if (hoursLeft >= 48) return `${Math.ceil(hoursLeft / 24)} days`;
+  const h = Math.max(1, Math.ceil(hoursLeft));
+  return `${h} hour${h === 1 ? '' : 's'}`;
+}
 
 /** Defensive fallbacks only (never surfaced, never applied on the user's behalf) */
 const FALLBACK: VeilSettings = {
   burnTtlSeconds: 7200,       // 2 h
   expireAfterSeconds: 86400,  // 24 h
   retentionHours: 168,        // 7 days
+  // b199 (owner decision, Oct 16 2026): history ON by default — conversations
+  // survive a restart unless the user turns on "read in the moment". The
+  // forensic trade-off is disclosed in the checkup and Settings copy.
   localHistory: true,
   storageMode: 'device',
   holdUntilUnlock: false,
@@ -64,6 +80,7 @@ const FALLBACK: VeilSettings = {
   readReceipts: true,
   nickname: '',
   setupDone: false,
+  onboardingPending: false,
   firstSessionDone: false,
   welcomeDismissed: false,
   attributionDone: false,

@@ -78,16 +78,17 @@ async function testSha256(): Promise<string> {
 
 /** PBKDF2 path check — confirms whether this binary has the compiled native
  *  module (fast) or falls back to the JS path (slow; App Lock unlock takes
- *  seconds on this path). Uses a small iteration count so the self-test
- *  itself never freezes the UI — this checks WHICH path runs, not the
- *  production 210,000-iteration timing. */
+ *  seconds on this path). Uses the lowest iteration count the native module
+ *  accepts (RV-27: native PBKDF2 refuses < 100,000, same as kdf.ts); natively
+ *  that is well under a second, so the self-test doesn't freeze the UI. This
+ *  checks WHICH path runs, not the production 210,000-iteration timing. */
 async function testPbkdf2Path(): Promise<string> {
   const native = getNativeCrypto();
   if (!native) return 'JS fallback only — native module not compiled into this build yet (App Lock unlock will take several seconds)';
   const t0 = Date.now();
-  await native.pbkdf2Sha256('veil-self-test', 'ab'.repeat(16), 2000, 32);
+  await native.pbkdf2Sha256('veil-self-test', 'ab'.repeat(16), 100_000, 32);
   const ms = Date.now() - t0;
-  return `native module responded in ${ms} ms for 2,000 iterations — App Lock unlock will be fast`;
+  return `native module responded in ${ms} ms for 100,000 iterations — App Lock unlock will be fast`;
 }
 
 /** (b66) Stego full round-trip ON THIS DEVICE: build the stream, LSB-embed it

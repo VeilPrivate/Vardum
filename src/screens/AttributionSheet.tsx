@@ -43,7 +43,7 @@ export function AttributionSheet({ onAnswer, onSkip }: AttributionSheetProps) {
         <TouchableOpacity style={styles.closeBtn} onPress={onSkip} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
           <Text style={styles.closeTxt}>✕</Text>
         </TouchableOpacity>
-        <Text style={styles.title}>How did you hear about VEIL?</Text>
+        <Text style={styles.title}>How did you hear about Vardum?</Text>
         <Text style={styles.sub}>Optional. One tap — it helps us know which channels work.</Text>
         <ScrollView style={styles.options} contentContainerStyle={{ paddingBottom: 4 }}>
           {ATTRIBUTION_OPTIONS.map((o) => (
@@ -62,7 +62,7 @@ export function AttributionSheet({ onAnswer, onSkip }: AttributionSheetProps) {
                 value={freeText}
                 onChangeText={setFreeText}
                 placeholder="In your own words (optional)"
-                placeholderTextColor="#31424d"
+                placeholderTextColor="#5E6464"
                 maxLength={ATTRIBUTION_MAX_DETAIL}
                 autoCapitalize="sentences"
                 autoCorrect={false}
@@ -84,20 +84,20 @@ export function AttributionSheet({ onAnswer, onSkip }: AttributionSheetProps) {
 }
 
 const styles = StyleSheet.create({
-  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'center', alignItems: 'center', zIndex: 40 },
-  card: { width: '100%', maxWidth: 380, maxHeight: '82%', backgroundColor: '#111820', borderRadius: 18, borderWidth: 1, borderColor: '#1d2733', padding: 20, paddingTop: 16 },
+  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(11,11,15,0.6)', justifyContent: 'center', alignItems: 'center', zIndex: 40 },
+  card: { width: '100%', maxWidth: 380, maxHeight: '82%', backgroundColor: '#15151B', borderRadius: 18, borderWidth: 1, borderColor: '#24242D', padding: 20, paddingTop: 16 },
   closeBtn: { position: 'absolute', top: 10, right: 14, padding: 4 },
-  closeTxt: { color: '#5a6b76', fontSize: 16 },
-  title: { color: '#e6eef2', fontSize: 18, fontWeight: '700', marginBottom: 6, paddingRight: 28 },
-  sub: { color: '#9db3ad', fontSize: 12.5, lineHeight: 17, marginBottom: 14 },
+  closeTxt: { color: '#5E6464', fontSize: 16 },
+  title: { color: '#FFFFFF', fontSize: 18, fontWeight: '700', marginBottom: 6, paddingRight: 28 },
+  sub: { color: '#8E9696', fontSize: 12.5, lineHeight: 17, marginBottom: 14 },
   options: { width: '100%' },
-  opt: { paddingVertical: 13, borderTopWidth: 1, borderTopColor: '#1a222b', alignItems: 'center', borderRadius: 6 },
-  optOn: { backgroundColor: 'rgba(124,244,200,0.06)' },
-  optTxt: { color: '#7cf4c8', fontSize: 15, fontWeight: '600' },
+  opt: { paddingVertical: 13, borderTopWidth: 1, borderTopColor: '#24242D', alignItems: 'center', borderRadius: 6 },
+  optOn: { backgroundColor: 'rgba(255,255,255,0.06)' },
+  optTxt: { color: '#FFFFFF', fontSize: 15, fontWeight: '600' },
   otherWrap: { marginTop: 12 },
-  otherInput: { color: '#e6eef2', backgroundColor: '#0d151c', borderWidth: 1, borderColor: '#1c2a34', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, fontSize: 15 },
-  otherBtn: { backgroundColor: '#123c34', borderRadius: 10, paddingVertical: 11, alignItems: 'center', marginTop: 10 },
-  otherBtnTxt: { color: '#7cf4c8', fontSize: 14, fontWeight: '700' },
+  otherInput: { color: '#FFFFFF', backgroundColor: '#0B0B0F', borderWidth: 1, borderColor: '#24242D', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 10, fontSize: 15 },
+  otherBtn: { backgroundColor: '#24242D', borderRadius: 10, paddingVertical: 11, alignItems: 'center', marginTop: 10 },
+  otherBtnTxt: { color: '#FFFFFF', fontSize: 14, fontWeight: '700' },
   skipBtn: { marginTop: 14, paddingVertical: 8, alignItems: 'center' },
-  skipTxt: { color: '#5fd4c4', fontSize: 13 },
+  skipTxt: { color: '#FFFFFF', fontSize: 13 },
 });

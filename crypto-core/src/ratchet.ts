@@ -1,86 +1,94 @@
 /**
- * @veil/crypto-core — veil-ratchet-3 session engine.
+ * @veil/crypto-core — veil-ratchet-6 session engine (b54 Batch A; Batch C protocol bump).
  *
- * PORTED VERBATIM from the live web bundle (index-DpU6jXgg.js), Sept 13 2026.
- * Minified-name -> clean-name map (strict invite family):
- *   [contact one-tap family, ported from index-DYGFL-4a.js Sept 13 2026:]
- *   Dm  = createContactSession     (initiator: ephemeral X25519 vs peer SPK + PQ encap)
- *   Om  = acceptContactSession     (responder: SPK priv unwrap + ratchet root)
- *   Em  = contactWriteSecrets      (HKDF 'veil-contact-write-v1' initiator/responder)
- *   am  = completeHandshake contact branch (initiator completes vs responder ratchet pub)
- *   xm/Sm/wm/Tm = X25519 pair / import pub / import priv seed (PKCS8-wrapped) / ECDH
- *   Yp  = createSession          (initiator create)
- *   Xp  = joinSession            (responder join)
- *   Zp  = completeHandshake      (initiator completes; strict + contact branches)
- *   $p  = encryptMessage         (send: symmetric ratchet step + envelope)
- *   em  = decryptMessage         (receive: skipped keys / ratchet step / chain catch-up)
- *   Jp  = stepRatchet            (double-ratchet step, PQ re-key)
- *   qp  = catchUpChain           (out-of-order catch-up, skipped-key store)
- *   Gp  = storeSkipped / Kp = takeSkipped
- *   Fp  = advanceChain           (mk = HMAC(ck,0x01), ck' = HMAC(ck,0x02))
- *   Pp  = deriveRoot             (HKDF-64 {rk,ck}, info='veil-ratchet-3/rk')
- *   Wp  = deriveRk0              (HKDF-32, salt='veil-ratchet-3:'+token, info='rk0')
- *   Up  = derivePpSecret         (HKDF-32, salt='veil-pp:'+token, info='pp')
- *   Hp  = sessionFingerprint     (HEX(SHA-256(shared)) upper, 4-char groups)
- *   Op  = generateEcdhPair (P-256) / kp = exportPubJwk / Ap = importPubJwk
- *   jp  = ecdh (256 bits) / Mp = combine / Np = hkdf / S = mlkemEncap / w = mlkemDecap
- *   C   = mlkemKeypair
+ * Session setup (PQXDH-style, two entry families):
+ *   strict invite  createSession / joinSession / completeHandshake
+ *                  X25519 session DH + ML-KEM-768 encapsulation + the invite
+ *                  link secret `k` (fragment-only, never sent to the relay)
+ *   one-tap contact createContactSession / acceptContactSession / completeHandshake
+ *                  ephemeral X25519 vs the peer's IK-signed SPK + ML-KEM-768
+ *                  encapsulation to the peer's IK-signed PQ prekey
+ * Post-quantum is MANDATORY: a missing or malformed PQ key, ciphertext or
+ * keygen failure aborts the handshake (no classical fallback).
  *
- * Hybrid: ECDH P-256 + ML-KEM-768 at handshake AND per-step PQ re-key
- * (header carries our current pqStepPub; peer's next ratchet step folds
- * the secret encapsulated to it, and answers with its own fresh step pub).
+ * After setup: the Signal Double Ratchet (rev. 4) over X25519 — KDF_RK =
+ * HKDF-SHA256(salt = RK, ikm = DH_out || PQ_secret), KDF_CK = HMAC(ck, 0x01/0x02),
+ * skipped-key store, MAX_SKIP guards — with an ML-KEM-768 secret mixed into
+ * every ratchet step (per-step PQ re-key) and every header's ratchet pub + PQ
+ * step pub signed with a session-scoped Ed25519 key derived from the root.
+ *
+ * Fingerprint: transcriptFingerprint over every public handshake value plus
+ * SHA-256(shared) (kdf.ts), so substitution or downgrade is user-visible.
+ *
+ * X25519 runs on @noble/curves directly (raw 32-byte keys, b64 on the wire).
  */
 
 import { toB64, fromB64, utf8 } from './bytes';
-import { hkdf, hmacSha256, sha256, combine, sessionFingerprint } from './kdf';
+import { hkdf, hmacSha256, sha256, combine, transcriptFingerprint } from './kdf';
 import { mlkemKeypair, mlkemEncap, mlkemDecap } from './mlkem';
 import { padPlaintext, unpadPlaintext } from './padding';
-import { ed25519 } from '@noble/curves/ed25519';
-import { RATCHET_VERSION, RATCHET_PROTOCOL_LATEST, RATCHET_PROTOCOL_SUPPORTED, ROOT_KEY_INFO, PP_INFO, RK0_INFO, RATCHET_SIG_INFO } from './constants';
+import { ed25519, x25519, edwardsToMontgomeryPub, edwardsToMontgomeryPriv } from '@noble/curves/ed25519';
+import {
+  RATCHET_PROTOCOL_LATEST, RATCHET_PROTOCOL_SUPPORTED, ROOT_KEY_INFO, RK0_SALT_PREFIX, RK0_INFO,
+  PP_SALT_PREFIX, PP_INFO, RATCHET_SIG_INFO, CONTACT_WRITE_INFO, FINGERPRINT_LABEL,
+  MLKEM768_PUB_BYTES, MLKEM768_CT_BYTES,
+} from './constants';
 
-const MAX_COUNTER_GAP = 500;   // fp — max skip ahead before "desynchronised"
-const MAX_SKIPPED_PER_CHAIN = 100; // pp
-const MAX_PROCESSED_IDS = 500; // mp
-const MAX_SEEN_PUBS = 64; // ou — replaced key epochs remembered for stale-header rejection
-const MAX_MY_PUBS = 64; // b197-r4 — own ratchet pubs remembered for own-echo rejection (bounded state)
+const MAX_COUNTER_GAP = 500;   // max skip ahead before "desynchronised"
+const MAX_SKIPPED_PER_CHAIN = 100;
+const MAX_PROCESSED_IDS = 500;
+const MAX_SEEN_PUBS = 64; // replaced key epochs remembered for stale-header rejection
+const MAX_MY_PUBS = 64; // own ratchet pubs remembered for own-echo rejection (bounded state)
 
 export type SessionRole = 'initiator' | 'responder';
 
+/** Thrown when a stored session predates the current protocol (hard cut). */
+export class LegacySessionError extends Error {
+  constructor() {
+    super('This chat used an older security protocol and has ended. Start a new chat.');
+    this.name = 'LegacySessionError';
+  }
+}
+
 export interface RatchetState {
   role: SessionRole;
-  /** protocol tag this session writes into headers (old sessions stay ratchet-3; new ones are ratchet-4) */
+  /** protocol tag written into headers — always RATCHET_PROTOCOL_LATEST */
   proto: string;
   /** replaced remote ratchet pubs — a header from an already-replaced epoch is rejected */
   seenRemotePubs: Set<string>;
-  /** one-tap contact session (bootstraps from pinned IK + published SPK) */
+  /** one-tap contact session (bootstraps from pinned IK + signed SPK / PQ prekey) */
   contact: boolean;
   ready: boolean;
   fingerprint: string | null;
-  pq: 'hybrid' | 'classical';
-  /** session ECDH (P-256) handshake keypair ("identity" of the session, not the Veil identity) */
-  ikPair: CryptoKeyPair;
-  ikPubJwk: string;
-  bound: { initiatorPubJwk: string; responderPubJwk: string; responderRatchetPubJwk?: string } | null;
-  /** ML-KEM handshake key (initiator) */
+  /** always 'hybrid' in veil-ratchet-6 (kept as a field so state is self-describing) */
+  pq: 'hybrid';
+  /** session handshake X25519 key (per session, not the Vardum identity) */
+  hsPriv: Uint8Array;
+  hsPub: string;
+  bound: { initiatorPub: string; responderPub: string; responderRatchetPub?: string } | null;
+  /** strict initiator: own handshake ML-KEM pair (pub kept for the transcript) */
+  pqPub: string | null;
   pqPriv: string | null;
   /** per-step PQ re-key pair */
   pqStepPriv: string | null;
   pqStepPub: string | null;
   /** ct encapsulated to the peer's current step pub — travels in our next header */
   pendingPqCt: string | null;
+  /** strict initiator: HKDF of the invite link secret `k`, mixed into the root */
   ppSecret: Uint8Array | null;
-  /** contact sessions: write secret derived via 'veil-contact-write-v1' (relay authorization) */
+  /** relay write credential (strict: random, link fragment; contact: HKDF of the root) */
   writeSecret: string | null;
-  /** b197 (audit H-1): when true, ratchet-key rotations MUST carry a valid Ed25519
-   *  signature derived from the session's pre-rotation shared secret — a spoofed
-   *  header.rp can no longer splice the session onto attacker-controlled keys.
-   *  Opt-in per session; legacy sessions (sigPubB64 === null) are untouched. */
-  signed: boolean;
+  /** session-scoped Ed25519 ratchet signing (null only on an initiator before completion).
+   *  Batch C (B9): sigPrivB64 = MY direction's key; sigPubB64 = the PEER's direction's public key. */
   sigPrivB64: string | null;
   sigPubB64: string | null;
-  ratchetPair: CryptoKeyPair;
-  ratchetPubJwk: string;
-  remoteRatchetPubJwk: string | null;
+  /** Batch C (V-12): canonical dials bound into the fingerprint (initiator keeps its own until completion) */
+  dials: string | null;
+  /** Batch C (B9): contact initiator — values needed to finish the transcript at completion */
+  contactPending: { initiatorIkPub: string; responderIkPub: string; ekPub: string; spkPub: string; pqPub: string; pqCt: string; sharedHash: string } | null;
+  ratchetPriv: Uint8Array | null;
+  ratchetPub: string;
+  remoteRatchetPub: string | null;
   myPubs: Set<string>;
   rootKey: Uint8Array;
   sendChain: Uint8Array | null;
@@ -92,94 +100,168 @@ export interface RatchetState {
   skipped: Map<string, Map<number, Uint8Array>>;
 }
 
-// ---------- P-256 ECDH helpers (Op / kp / Ap / jp) ----------
+// ---------- X25519 (@noble/curves) ----------
 
-async function generateEcdhPair(): Promise<CryptoKeyPair> {
-  return crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']) as Promise<CryptoKeyPair>;
+interface X25519Pair { priv: Uint8Array; pub: string }
+
+function x25519Pair(): X25519Pair {
+  const priv = x25519.utils.randomPrivateKey();
+  return { priv, pub: toB64(x25519.getPublicKey(priv)) };
 }
 
-async function exportPubJwk(key: CryptoKey): Promise<string> {
-  return JSON.stringify(await crypto.subtle.exportKey('jwk', key));
+function x25519PubBytes(pubB64: string): Uint8Array {
+  let b: Uint8Array;
+  try { b = fromB64(pubB64); } catch { throw new Error('Malformed X25519 public key.'); }
+  if (b.length !== 32) throw new Error('Malformed X25519 public key.');
+  return b;
 }
 
-async function importPubJwk(jwk: string): Promise<CryptoKey> {
-  return crypto.subtle.importKey('jwk', JSON.parse(jwk), { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+/** X25519 DH. noble rejects low-order points (all-zero output) — re-checked here. */
+function dh(priv: Uint8Array, pubB64: string): Uint8Array {
+  const out = x25519.getSharedSecret(priv, x25519PubBytes(pubB64));
+  if (out.every((x) => x === 0)) throw new Error('Invalid X25519 shared secret.');
+  return out;
 }
 
-async function ecdh(priv: CryptoKey, pub: CryptoKey): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: pub }, priv, 256));
+// ---------- ML-KEM input checks (fail closed) ----------
+
+function requirePqPub(pubB64: string | null | undefined, what: string): string {
+  let ok = false;
+  try { ok = !!pubB64 && fromB64(pubB64).length === MLKEM768_PUB_BYTES; } catch { ok = false; }
+  if (!ok) throw new Error(`Post-quantum key missing or malformed (${what}) — refusing a downgraded session.`);
+  return pubB64 as string;
 }
 
-// ---------- X25519 helpers (xm / Sm / wm / Tm) ----------
-
-/** xm: ephemeral X25519 keypair for the contact handshake. */
-async function x25519Generate(): Promise<CryptoKeyPair> {
-  return crypto.subtle.generateKey({ name: 'X25519' }, true, ['deriveBits']) as Promise<CryptoKeyPair>;
+function requirePqCt(ctB64: string | null | undefined, what: string): string {
+  let ok = false;
+  try { ok = !!ctB64 && fromB64(ctB64).length === MLKEM768_CT_BYTES; } catch { ok = false; }
+  if (!ok) throw new Error(`Post-quantum ciphertext missing or malformed (${what}) — refusing a downgraded session.`);
+  return ctB64 as string;
 }
 
-/** Sm: import a raw X25519 public key from base64. */
-async function x25519ImportPub(pubB64: string): Promise<CryptoKey> {
-  return crypto.subtle.importKey('raw', fromB64(pubB64) as BufferSource, { name: 'X25519' }, true, []);
+/**
+ * PQ key generation, fail-closed: if ML-KEM key generation fails, the
+ * operation aborts loudly and the caller retries. Nothing is ever sent
+ * without its post-quantum binding.
+ */
+async function pqStepPair(): Promise<{ pub: string; priv: string }> {
+  try {
+    return await mlkemKeypair();
+  } catch {
+    throw new Error('Post-quantum key generation failed — aborted to avoid a security downgrade. Please retry.');
+  }
 }
 
-/** wm: wrap a 32-byte X25519 seed in the fixed PKCS8 prefix and import as a private key. */
-const X25519_PKCS8_PREFIX = new Uint8Array([48, 46, 2, 1, 0, 48, 5, 6, 3, 43, 101, 110, 4, 34, 4, 32]);
-async function x25519ImportPrivSeed(privSeedB64: string): Promise<CryptoKey> {
-  const der = new Uint8Array(48);
-  der.set(X25519_PKCS8_PREFIX, 0);
-  der.set(fromB64(privSeedB64), 16);
-  return crypto.subtle.importKey('pkcs8', der as BufferSource, { name: 'X25519' }, true, ['deriveBits']);
-}
+// ---------- roots / chains ----------
 
-/** Tm: X25519 ECDH -> 256-bit shared secret. */
-async function x25519Ecdh(priv: CryptoKey, pub: CryptoKey): Promise<Uint8Array> {
-  return new Uint8Array(await crypto.subtle.deriveBits({ name: 'X25519', public: pub }, priv, 256));
-}
-
-// ---------- contact write secrets (Em) ----------
-
-/** Em: per-role relay write secrets for contact sessions. */
-async function contactWriteSecrets(root: Uint8Array): Promise<{ initiator: string; responder: string }> {
-  // SPEC (builder reference, Sept 18): the write credentials are LOWERCASE-HEX
-  // strings (64 chars), never base64. The relay stores lowercaseHex(SHA256(utf8(secret)))
-  // and the join/fetch/submit calls send the plain hex string — a base64 secret here
-  // silently produced a completely different credential than the web client derives.
-  const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
-  const initiator = await hkdf(root, utf8('veil-contact-write-v1'), 'initiator', 32);
-  const responder = await hkdf(root, utf8('veil-contact-write-v1'), 'responder', 32);
-  return { initiator: hex(initiator), responder: hex(responder) };
-}
-
-// ---------- roots / chains (Pp / Fp / Wp / Up / Hp) ----------
-
-/** Pp: HKDF-64 -> {rk, ck}. salt first, ikm (+optional extra) second. */
+/** KDF_RK: HKDF-64 -> {rk, ck}; salt = current root, ikm = DH_out (|| PQ secret). */
 async function deriveRoot(salt: Uint8Array, ikm: Uint8Array, extra: Uint8Array | null): Promise<{ rk: Uint8Array; ck: Uint8Array }> {
   const material = extra ? combine(ikm, extra) : ikm;
   const out = await hkdf(material, salt, ROOT_KEY_INFO, 64);
   return { rk: out.slice(0, 32), ck: out.slice(32, 64) };
 }
 
-/** Wp: the "rk0" handshake root. */
+/** Handshake root rk0 = HKDF(shared, salt = `vardum-ratchet-6:<token>`, info = rk0). */
 async function deriveRk0(shared: Uint8Array, token: string): Promise<Uint8Array> {
-  return hkdf(shared, utf8(`veil-ratchet-3:${token}`), RK0_INFO, 32);
+  return hkdf(shared, utf8(`${RK0_SALT_PREFIX}${token}`), RK0_INFO, 32);
 }
 
-/** Up: strict-invite prekey secret from the #w= fragment (never sent to the relay). */
+/** Invite link secret term. `k` travels only in the link fragment, never to the relay. */
 export async function derivePpSecret(inviteSecret: string, token: string): Promise<Uint8Array> {
-  if (!inviteSecret) return new Uint8Array();
-  return hkdf(utf8(inviteSecret), utf8(`veil-pp:${token}`), PP_INFO, 32);
+  if (!inviteSecret) throw new Error('This invite link is missing its secret — ask for a fresh link.');
+  return hkdf(utf8(inviteSecret), utf8(`${PP_SALT_PREFIX}${token}`), PP_INFO, 32);
+}
+
+/** One-tap contact relay write credentials (lowercase hex, 64 chars). */
+async function contactWriteSecrets(root: Uint8Array): Promise<{ initiator: string; responder: string }> {
+  const hex = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, '0')).join('');
+  const initiator = await hkdf(root, utf8(CONTACT_WRITE_INFO), 'initiator', 32);
+  const responder = await hkdf(root, utf8(CONTACT_WRITE_INFO), 'responder', 32);
+  return { initiator: hex(initiator), responder: hex(responder) };
 }
 
 interface ChainKeys { ck: Uint8Array; mk: Uint8Array }
 
-/** Fp: symmetric chain step. */
+/** KDF_CK: mk = HMAC(ck, 0x01), ck' = HMAC(ck, 0x02). */
 async function advanceChain(chain: Uint8Array): Promise<ChainKeys> {
   const mk = await hmacSha256(chain, new Uint8Array([1]));
   const ck = await hmacSha256(chain, new Uint8Array([2]));
   return { ck, mk };
 }
 
-// ---------- skipped keys (Gp / Kp) ----------
+// ---------- fingerprints ----------
+
+/**
+ * Batch C (V-12): session dials, canonical form. Both peers bind the SAME
+ * string into the fingerprint (and, for contact sessions, the IK-signed
+ * request), so a relay that rewrites the burn / expiry dials on the session
+ * row produces a visible fingerprint mismatch instead of a silent change.
+ */
+export interface DialsInput { defaultTtlSeconds: number; expireAfterSeconds: number; keyRetentionHours: number; burnAfterOpen: boolean }
+
+export const DIAL_LIMITS = {
+  ttlMax: 30 * 24 * 3600, // 30 days (forum)
+  expireMax: 30 * 24 * 3600,
+  retentionMax: 24 * 30,
+} as const;
+
+/** Clamp to whole numbers inside the supported ranges; non-numbers fall back to the app defaults. */
+export function clampDials(d: Partial<DialsInput> | null | undefined): DialsInput {
+  const int = (x: unknown, lo: number, hi: number, dflt: number) => {
+    const n = Number(x);
+    if (!Number.isFinite(n) || !Number.isInteger(n)) return dflt;
+    return Math.min(hi, Math.max(lo, n));
+  };
+  return {
+    defaultTtlSeconds: int(d?.defaultTtlSeconds, 0, DIAL_LIMITS.ttlMax, 7200),
+    expireAfterSeconds: int(d?.expireAfterSeconds, 0, DIAL_LIMITS.expireMax, 86400),
+    keyRetentionHours: int(d?.keyRetentionHours, 0, DIAL_LIMITS.retentionMax, 168), // 0 = Off (settings QUIET_OPTIONS)
+    burnAfterOpen: d?.burnAfterOpen === true,
+  };
+}
+
+export function canonicalDials(d: Partial<DialsInput> | null | undefined): string {
+  const c = clampDials(d);
+  return `t=${c.defaultTtlSeconds};e=${c.expireAfterSeconds};r=${c.keyRetentionHours};b=${c.burnAfterOpen ? 1 : 0}`;
+}
+
+/** Batch C (NF-7, V-12): the responder's first ratchet pub and the dials join the transcript. */
+async function inviteFingerprint(
+  token: string, initiatorPub: string, responderPub: string, responderRatchetPub: string,
+  initiatorPqPub: string, responderPqCt: string, dials: string, shared: Uint8Array,
+): Promise<string> {
+  return transcriptFingerprint(FINGERPRINT_LABEL, [
+    utf8(RATCHET_PROTOCOL_LATEST), utf8('invite'), utf8(token),
+    fromB64(initiatorPub), fromB64(responderPub), fromB64(responderRatchetPub),
+    fromB64(initiatorPqPub), fromB64(responderPqCt), utf8(dials),
+    await sha256(shared),
+  ]);
+}
+
+/** Batch C (B9, NF-7, V-12): both identity keys, the responder ratchet pub and the dials join the transcript. */
+async function contactFingerprint(
+  token: string, initiatorIkPub: string, responderIkPub: string, ekPub: string, spkPub: string, pqPub: string, pqCt: string,
+  initiatorSessionPub: string, responderPub: string, responderRatchetPub: string, dials: string, sharedHash: Uint8Array,
+): Promise<string> {
+  return transcriptFingerprint(FINGERPRINT_LABEL, [
+    utf8(RATCHET_PROTOCOL_LATEST), utf8('contact'), utf8(token),
+    fromB64(initiatorIkPub), fromB64(responderIkPub),
+    fromB64(ekPub), fromB64(spkPub), fromB64(pqPub), fromB64(pqCt), fromB64(initiatorSessionPub),
+    fromB64(responderPub), fromB64(responderRatchetPub), utf8(dials),
+    sharedHash,
+  ]);
+}
+
+/** Batch C (B9): X25519 term against the responder's long-term identity key
+ *  (Ed25519 IK converted to Montgomery form), as in X3DH's DH(EK, IK_B). */
+function ikPubToX25519(ikPubB64: string): string {
+  let b: Uint8Array;
+  try { b = fromB64(ikPubB64); } catch { throw new Error('Malformed identity key.'); }
+  if (b.length !== 32) throw new Error('Malformed identity key.');
+  return toB64(edwardsToMontgomeryPub(b));
+}
+
+// ---------- skipped keys ----------
 
 function storeSkipped(state: RatchetState, rp: string, n: number, mk: Uint8Array): void {
   let per = state.skipped.get(rp);
@@ -204,26 +286,19 @@ function takeSkipped(state: RatchetState, header: EnvelopeHeader): Uint8Array | 
 }
 
 /**
- * b185 SPEC CONFORMANCE FIX (Signal Double Ratchet spec, DHRatchet / header.pn):
- * before accepting the peer's NEW ratchet pub and rotating, skip-and-store
- * message keys on the CURRENT receive chain up to header.pn (the length of
- * the sender's previous sending chain). Stragglers from the old chain that
- * arrive after the rotation (relay reordering, re-fetch, offline backlog)
- * then still decrypt from the skipped-key store instead of being rejected
- * forever as a "stale epoch". Receiver-side only — no wire-format change,
- * fully compatible with peers that never rotate mid-backlog.
+ * Signal DR spec (DHRatchet / header.pn): before accepting the peer's NEW
+ * ratchet pub and rotating, skip-and-store message keys on the CURRENT
+ * receive chain up to header.pn, so old-chain stragglers stay decryptable.
  */
 async function skipOldChainBeforeRotation(state: RatchetState, pn: number): Promise<void> {
-  if (!state.recvChain || state.remoteRatchetPubJwk === null) return; // no old chain to protect
+  if (!state.recvChain || state.remoteRatchetPub === null) return; // no old chain to protect
   if (pn < state.recvCount || pn - state.recvCount > MAX_COUNTER_GAP) {
-    // Desync guard (same rule as messageKeyFor): a pn that rewinds or runs
-    // far past our counter is a malformed header — fail closed, change nothing.
     throw new Error('Message counter out of range — the session is desynchronised.');
   }
   while (state.recvCount < pn) {
     const step = await advanceChain(state.recvChain);
     state.recvChain = step.ck;
-    storeSkipped(state, state.remoteRatchetPubJwk, state.recvCount, step.mk);
+    storeSkipped(state, state.remoteRatchetPub, state.recvCount, step.mk);
     state.recvCount += 1;
   }
 }
@@ -232,24 +307,24 @@ async function skipOldChainBeforeRotation(state: RatchetState, pn: number): Prom
 
 export interface EnvelopeHeader {
   v: string;
-  /** sender's current ratchet pub (JWK string) */
+  /** sender's current X25519 ratchet pub (raw, b64) */
   rp: string;
   /** sender's previous chain length at last ratchet step */
   pn: number;
   /** message counter in the current chain */
   n: number;
-  /** per-step PQ: our current step pub */
+  /** per-step PQ: sender's current ML-KEM step pub (mandatory) */
   pq?: string;
   /** ct encapsulated to the peer's step pub */
   pqct?: string;
-  /** b197 (audit H-1): Ed25519 signature over the ratchet pub (signed sessions only) */
+  /** Ed25519 signature over rp + pq with the session signing key (mandatory) */
   sig?: string;
 }
 
 export interface Envelope {
   ciphertext: string;
   iv: string;
-  /** serialized JSON header — AES-GCM AAD */
+  /** serialized JSON header — AES-GCM AAD (the exact sender bytes) */
   header: string;
   byteLength?: number;
 }
@@ -258,82 +333,71 @@ async function importAesKey(mk: Uint8Array): Promise<CryptoKey> {
   return crypto.subtle.importKey('raw', mk as BufferSource, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-// ---------- authenticated ratchet keys (b197, audit H-1) ----------
+// ---------- signed ratchet keys ----------
 
 /**
- * b197 (audit H-1): derive a session-scoped Ed25519 signing pair from the
- * PRE-ROTATION shared secret (rk0 for strict sessions, the contact root for
- * one-tap sessions). Both peers derive the SAME pair: each side signs its own
- * ratchet pubs and the other verifies. Without this, an on-path attacker who
- * can inject an envelope with their own rp rotates the receiver onto keys the
- * attacker can compute (ECDH is symmetric), then delivers an envelope that
- * authenticates — the classic unsigned-DHr splice. Legacy sessions
- * (sigPubB64 === null) keep the unchanged unsigned behavior: zero wire-compat
- * risk until web-client parity lands.
+ * Session-scoped Ed25519 signing pairs derived from the handshake root (rk0).
+ * Batch C (B9): one pair PER DIRECTION. Each side keeps only its own private
+ * key (sigPrivB64) and the peer's public key (sigPubB64), so a header signed
+ * by one side can never be reflected back and accepted as the other's.
+ * Both pairs come from rk0, so this is defence in depth inside the session
+ * (the root salt already makes a splice non-exploitable), not peer authentication.
  */
-async function deriveSigPair(shared: Uint8Array, token: string): Promise<{ privB64: string; pubB64: string }> {
-  const seed = await hkdf(shared, utf8(`${RATCHET_SIG_INFO}:${token}`), RATCHET_SIG_INFO, 32);
-  return { privB64: toB64(seed), pubB64: toB64(ed25519.getPublicKey(seed)) };
+async function deriveSigPairs(rk0: Uint8Array, token: string, role: SessionRole): Promise<{ privB64: string; pubB64: string }> {
+  const pair = async (dir: SessionRole) => {
+    const seed = await hkdf(rk0, utf8(`${RATCHET_SIG_INFO}:${token}`), `${RATCHET_SIG_INFO}/${dir}`, 32);
+    return { priv: seed, pub: ed25519.getPublicKey(seed) };
+  };
+  const mine = await pair(role);
+  const theirs = await pair(role === 'initiator' ? 'responder' : 'initiator');
+  return { privB64: toB64(mine.priv), pubB64: toB64(theirs.pub) };
 }
 
-/** b197: sign the current ratchet pub (no-op on unsigned sessions). */
-function signRatchetPub(state: RatchetState, rpJwk: string): string | undefined {
-  if (!state.sigPrivB64) return undefined;
-  return toB64(ed25519.sign(utf8(`${RATCHET_SIG_INFO}:${rpJwk}`), fromB64(state.sigPrivB64)));
+function ratchetSigMessage(rp: string, pq: string | undefined): Uint8Array {
+  return utf8(`${RATCHET_SIG_INFO}:${rp}:${pq ?? ''}`);
 }
 
-/** b197: fail-closed verification on ratchet rotation (no-op on unsigned sessions). */
-function verifyRatchetPubSig(state: RatchetState, rpJwk: string, sig: string | undefined): void {
-  if (!state.sigPubB64) return;
-  if (!sig) throw new Error('Unsigned ratchet rotation rejected — this session requires signed key epochs.');
-  // noble v1 order: verify(signature, message, publicKey)
-  if (!ed25519.verify(fromB64(sig), utf8(`${RATCHET_SIG_INFO}:${rpJwk}`), fromB64(state.sigPubB64))) {
-    throw new Error('Invalid ratchet rotation signature — header did not authenticate against the session.');
-  }
+function signRatchetPub(state: RatchetState, rp: string, pq: string | undefined): string {
+  if (!state.sigPrivB64) throw new Error('Session signing key missing — the handshake is incomplete.');
+  return toB64(ed25519.sign(ratchetSigMessage(rp, pq), fromB64(state.sigPrivB64)));
 }
 
-// ---------- session creation (Yp) ----------
-
-export interface CreatedSession {
-  state: RatchetState;
-  /** the initiator's session pub JWK — the `initiator_pub_jwk` field */
-  initiatorPubJwk: string;
-  /** ML-KEM pub (~1184B, b64) — the `initiator_pq_pub` field */
-  initiatorPqPub: string | null;
+/** Fail-closed verification on every ratchet rotation. */
+function verifyRatchetPubSig(state: RatchetState, header: EnvelopeHeader): void {
+  if (!state.sigPubB64) throw new Error('Session signing key missing — the handshake is incomplete.');
+  if (!header.sig) throw new Error('Unsigned ratchet rotation rejected.');
+  let ok = false;
+  // T-2: strict RFC 8032 (noble's default ZIP-215 accepts forgeries under small-order keys)
+  try { ok = ed25519.verify(fromB64(header.sig), ratchetSigMessage(header.rp, header.pq), fromB64(state.sigPubB64), { zip215: false }); } catch { ok = false; }
+  if (!ok) throw new Error('Invalid ratchet rotation signature — header did not authenticate against the session.');
 }
 
-/** Initiator creates a strict session (Yp). inviteSecret = the #w= fragment. */
-export async function createSession(token: string, inviteSecret: string, hybrid = true, signed = false): Promise<CreatedSession> {
-  const ikPair = await generateEcdhPair();
-  const ikPubJwk = await exportPubJwk(ikPair.publicKey);
-  const ppSecret = await derivePpSecret(inviteSecret, token);
-  let pq: { pub: string; priv: string } | null = null;
-  if (hybrid) {
-    try { pq = await mlkemKeypair(); } catch { pq = null; }
-  }
-  const state: RatchetState = {
-    role: 'initiator',
+function emptyState(role: SessionRole, contact: boolean, hs: X25519Pair): RatchetState {
+  return {
+    role,
     proto: RATCHET_PROTOCOL_LATEST,
     seenRemotePubs: new Set(),
-    contact: false,
+    contact,
     ready: false,
     fingerprint: null,
-    pq: hybrid && pq ? 'hybrid' : 'classical',
-    ikPair,
-    ikPubJwk,
+    pq: 'hybrid',
+    hsPriv: hs.priv,
+    hsPub: hs.pub,
     bound: null,
-    pqPriv: pq?.priv ?? null,
+    pqPub: null,
+    pqPriv: null,
     pqStepPriv: null,
     pqStepPub: null,
     pendingPqCt: null,
-    ppSecret: ppSecret.length ? ppSecret : null,
+    ppSecret: null,
     writeSecret: null,
-    signed,
     sigPrivB64: null,
     sigPubB64: null,
-    ratchetPair: null as unknown as CryptoKeyPair,
-    ratchetPubJwk: '',
-    remoteRatchetPubJwk: null,
+    dials: null,
+    contactPending: null,
+    ratchetPriv: null,
+    ratchetPub: '',
+    remoteRatchetPub: null,
     myPubs: new Set<string>(),
     rootKey: new Uint8Array(32),
     sendChain: null,
@@ -344,328 +408,264 @@ export async function createSession(token: string, inviteSecret: string, hybrid 
     processedIds: new Set<string>(),
     skipped: new Map(),
   };
-  return { state, initiatorPubJwk: ikPubJwk, initiatorPqPub: pq ? pq.pub : null };
 }
 
-// ---------- responder join (Xp) ----------
+// ---------- strict invite: initiator create ----------
+
+export interface CreatedSession {
+  state: RatchetState;
+  /** initiator session X25519 pub (b64) — the `initiator_pub_jwk` relay field */
+  initiatorPub: string;
+  /** ML-KEM-768 pub (b64) — the `initiator_pq_pub` relay field */
+  initiatorPqPub: string;
+}
+
+/** Initiator creates a strict session. inviteSecret = the link's `k=` fragment.
+ *  dials = the initiator's OWN dials; kept in state and bound into the fingerprint at completion. */
+export async function createSession(token: string, inviteSecret: string, dials: Partial<DialsInput>): Promise<CreatedSession> {
+  const hs = x25519Pair();
+  const ppSecret = await derivePpSecret(inviteSecret, token);
+  const pq = await pqStepPair();
+  const state = emptyState('initiator', false, hs);
+  state.pqPub = pq.pub;
+  state.pqPriv = pq.priv;
+  state.ppSecret = ppSecret;
+  state.dials = canonicalDials(dials);
+  return { state, initiatorPub: hs.pub, initiatorPqPub: pq.pub };
+}
+
+// ---------- strict invite: responder join ----------
 
 export interface JoinedSession {
   state: RatchetState;
-  responderPubJwk: string;
-  responderRatchetPubJwk: string;
+  responderPub: string;
+  responderRatchetPub: string;
   /** ct encapsulated to the initiator's ML-KEM pub — the `responder_pq_ct` field */
-  responderPqCt: string | null;
+  responderPqCt: string;
   fingerprint: string;
 }
 
-/** Responder joins (Xp). Session is READY on return (root1 = send chain). */
+/** Responder joins. Session is READY on return (root1 = send chain). */
 export async function joinSession(
   token: string,
   inviteSecret: string,
-  initiatorPubJwk: string,
+  initiatorPub: string,
   initiatorPqPub: string | null,
-  hybrid = true,
-  signed = false,
+  /** the dials as read from the session row — bound into the fingerprint (V-12) */
+  dials: Partial<DialsInput>,
 ): Promise<JoinedSession> {
-  const initiatorPub = await importPubJwk(initiatorPubJwk);
-  const ikPair = await generateEcdhPair();
-  const dh = await ecdh(ikPair.privateKey, initiatorPub);
-  let shared = dh;
-  let pqCt: string | null = null;
-  let stepPq: { pub: string; priv: string } | null = null;
-  if (hybrid && initiatorPqPub) {
-    const { ct, secret } = await mlkemEncap(initiatorPqPub);
-    shared = combine(dh, secret);
-    pqCt = ct;
-    try { stepPq = await mlkemKeypair(); } catch { stepPq = null; }
-  }
-  shared = combine(shared, await derivePpSecret(inviteSecret, token));
+  requirePqPub(initiatorPqPub, 'invite');
+  const pp = await derivePpSecret(inviteSecret, token);
+  const hs = x25519Pair();
+  const dhOut = dh(hs.priv, initiatorPub);
+  const { ct, secret } = await mlkemEncap(initiatorPqPub as string);
+  const stepPq = await pqStepPair();
+  const shared = combine(combine(dhOut, secret), pp);
   const rk0 = await deriveRk0(shared, token);
-  const sig = signed ? await deriveSigPair(rk0, token) : null;
-  const ratchetPair = await generateEcdhPair();
-  const root1 = await deriveRoot(rk0, await ecdh(ratchetPair.privateKey, initiatorPub), null);
-  const fingerprint = await sessionFingerprint(shared);
-  const state: RatchetState = {
-    role: 'responder',
-    proto: RATCHET_PROTOCOL_LATEST,
-    seenRemotePubs: new Set(),
-    contact: false,
+  const sig = await deriveSigPairs(rk0, token, 'responder');
+  const ratchet = x25519Pair();
+  const root1 = await deriveRoot(rk0, dh(ratchet.priv, initiatorPub), null);
+  const dialsStr = canonicalDials(dials);
+  const fingerprint = await inviteFingerprint(token, initiatorPub, hs.pub, ratchet.pub, initiatorPqPub as string, ct, dialsStr, shared);
+  const state = emptyState('responder', false, hs);
+  Object.assign(state, {
     ready: true,
     fingerprint,
-    pq: pqCt ? 'hybrid' : 'classical',
-    ikPair,
-    ikPubJwk: await exportPubJwk(ikPair.publicKey),
-    bound: {
-      initiatorPubJwk,
-      responderPubJwk: await exportPubJwk(ikPair.publicKey),
-      responderRatchetPubJwk: await exportPubJwk(ratchetPair.publicKey),
-    },
-    pqPriv: null,
-    pqStepPriv: stepPq?.priv ?? null,
-    signed,
-    sigPrivB64: sig?.privB64 ?? null,
-    sigPubB64: sig?.pubB64 ?? null,
-    pqStepPub: stepPq?.pub ?? null,
-    pendingPqCt: null,
-    ppSecret: null,
-    writeSecret: null,
-    ratchetPair,
-    ratchetPubJwk: await exportPubJwk(ratchetPair.publicKey),
-    remoteRatchetPubJwk: initiatorPubJwk,
-    myPubs: new Set<string>(),
+    dials: dialsStr,
+    bound: { initiatorPub, responderPub: hs.pub, responderRatchetPub: ratchet.pub },
+    hsPriv: new Uint8Array(32), // Batch H (R6-1-07): used above, never again
+    pqStepPriv: stepPq.priv,
+    pqStepPub: stepPq.pub,
+    sigPrivB64: sig.privB64,
+    sigPubB64: sig.pubB64,
+    ratchetPriv: ratchet.priv,
+    ratchetPub: ratchet.pub,
+    remoteRatchetPub: initiatorPub,
     rootKey: root1.rk,
     sendChain: root1.ck,
-    recvChain: null,
-    sendCount: 0,
-    prevSendCount: 0,
-    recvCount: 0,
-    processedIds: new Set<string>(),
-    skipped: new Map(),
-  };
-  state.myPubs.add(state.ratchetPubJwk);
-  return {
-    state,
-    responderPubJwk: state.ikPubJwk,
-    responderRatchetPubJwk: state.ratchetPubJwk,
-    responderPqCt: pqCt,
-    fingerprint,
-  };
+  });
+  state.myPubs.add(ratchet.pub);
+  return { state, responderPub: hs.pub, responderRatchetPub: ratchet.pub, responderPqCt: ct, fingerprint };
 }
 
-
-// ---------- one-tap contact session family (Dm / Om, ported from DYGFL-4a) ----------
+// ---------- one-tap contact family ----------
 
 export interface ContactPeerPrekeys {
-  /** peer's published X25519 SPK (looked up from the identity gate; SPK_sig verified vs pinned IK) */
+  /** peer's X25519 SPK — SPK_sig verified against the PINNED IK by the caller */
   spkPubB64: string;
-  /** peer's published ML-KEM-768 pub (hybrid) */
-  pqPubB64?: string | null;
+  /** peer's ML-KEM-768 prekey — pq_sig verified against the PINNED IK by the caller */
+  pqPubB64: string;
+  /** Batch C (B9): the peer's PINNED Ed25519 identity key — adds DH(EK, IK_peer) */
+  ikPubB64: string;
 }
 
 export interface CreatedContactSession {
   state: RatchetState;
   /** ephemeral X25519 pub — travels to the peer in the session request */
   ekPubB64: string;
-  /** ML-KEM ct encapsulated to the peer's pq_pub ('' when classical) */
+  /** ML-KEM ct encapsulated to the peer's pq_pub */
   pqCt: string;
-  /** the session-bound P-256 pub JWK presented as the initiator's handshake key */
-  ikPubJwk: string;
+  /** initiator session X25519 pub — the `initiator_pub_jwk` relay field */
+  sessionPub: string;
   writeSecrets: { initiator: string; responder: string };
   fingerprint: string;
 }
 
-/** Dm: initiator bootstraps a one-tap session from the pinned peer's published prekeys. */
-export async function createContactSession(token: string, peer: ContactPeerPrekeys, signed = false): Promise<CreatedContactSession> {
-  const ek = await x25519Generate();
-  const ekPubB64 = toB64(new Uint8Array(await crypto.subtle.exportKey('raw', ek.publicKey)));
-  let shared = await x25519Ecdh(ek.privateKey, await x25519ImportPub(peer.spkPubB64));
-  let pqCt = '';
-  let hybrid = false;
-  if (peer.pqPubB64) {
-    const enc = await mlkemEncap(peer.pqPubB64);
-    shared = combine(shared, enc.secret);
-    pqCt = enc.ct;
-    hybrid = true;
-  }
+/**
+ * Initiator bootstraps a one-tap session from the pinned peer's signed prekeys.
+ * shared = DH(EK, SPK) ‖ DH(EK, IK_peer) ‖ ML-KEM ss  (Batch C, B9: the IK term
+ * means only the holder of the peer's long-term identity key can derive the root).
+ * The fingerprint is finished at completion, once the responder's keys are known.
+ */
+export async function createContactSession(
+  token: string, peer: ContactPeerPrekeys, myIkPubB64: string, dials: Partial<DialsInput>,
+): Promise<CreatedContactSession> {
+  requirePqPub(peer.pqPubB64, 'contact prekey');
+  const ek = x25519Pair();
+  const dhSpk = dh(ek.priv, peer.spkPubB64);
+  const dhIk = dh(ek.priv, ikPubToX25519(peer.ikPubB64));
+  const enc = await mlkemEncap(peer.pqPubB64);
+  const shared = combine(combine(dhSpk, dhIk), enc.secret);
   const rootKey = await deriveRk0(shared, token);
-  const sig = signed ? await deriveSigPair(rootKey, token) : null;
+  const sig = await deriveSigPairs(rootKey, token, 'initiator');
   const writeSecrets = await contactWriteSecrets(rootKey);
-  const ikPair = await generateEcdhPair();
-  const ikPubJwk = await exportPubJwk(ikPair.publicKey);
-  const fingerprint = await sessionFingerprint(shared);
-  const state: RatchetState = {
-    role: 'initiator',
-    proto: RATCHET_PROTOCOL_LATEST,
-    seenRemotePubs: new Set(),
-    contact: true,
-    ready: false,
-    fingerprint,
-    pq: hybrid ? 'hybrid' : 'classical',
-    ikPair,
-    ikPubJwk,
-    bound: null,
-    pqPriv: null,
-    pqStepPriv: null,
-    pqStepPub: null,
-    pendingPqCt: null,
-    ppSecret: null,
+  const hs = x25519Pair();
+  const state = emptyState('initiator', true, hs);
+  Object.assign(state, {
     writeSecret: writeSecrets.initiator,
-    signed,
-    sigPrivB64: sig?.privB64 ?? null,
-    sigPubB64: sig?.pubB64 ?? null,
-    ratchetPair: null as unknown as CryptoKeyPair,
-    ratchetPubJwk: '',
-    remoteRatchetPubJwk: null,
-    myPubs: new Set<string>(),
+    sigPrivB64: sig.privB64,
+    sigPubB64: sig.pubB64,
     rootKey,
-    sendChain: null,
-    recvChain: null,
-    sendCount: 0,
-    prevSendCount: 0,
-    recvCount: 0,
-    processedIds: new Set<string>(),
-    skipped: new Map(),
-  };
-  return { state, ekPubB64, pqCt, ikPubJwk, writeSecrets, fingerprint };
+    dials: canonicalDials(dials),
+    contactPending: {
+      initiatorIkPub: myIkPubB64, responderIkPub: peer.ikPubB64, ekPub: ek.pub,
+      spkPub: peer.spkPubB64, pqPub: peer.pqPubB64, pqCt: enc.ct, sharedHash: toB64(await sha256(shared)),
+    },
+  });
+  return { state, ekPubB64: ek.pub, pqCt: enc.ct, sessionPub: hs.pub, writeSecrets, fingerprint: '' };
 }
 
 export interface ContactRequest {
   /** initiator's ephemeral X25519 pub */
   ekPubB64: string;
-  /** ct encapsulated to OUR pq_pub (null/'' when the request was classical) */
-  pqCt?: string | null;
-  /** OUR SPK private seed (device keyvault) */
+  /** ct encapsulated to OUR pq_pub */
+  pqCt: string;
+  /** OUR SPK (device keyvault) */
   spkPrivB64: string;
-  /** OUR ML-KEM private key (device keyvault; required to unwrap a hybrid request) */
-  pqPrivB64?: string | null;
-  /** initiator's session P-256 pub JWK (from the request) */
-  initiatorP256Jwk: string;
+  spkPubB64: string;
+  /** OUR ML-KEM prekey (device keyvault) */
+  pqPrivB64: string;
+  pqPubB64: string;
+  /** initiator's session X25519 pub (from the request; covered by initiator_sig) */
+  initiatorSessionPub: string;
+  /** Batch C (B9): OUR identity seed (adds DH(IK, EK)) and public key */
+  ikSeedB64: string;
+  ikPubB64: string;
+  /** the initiator's identity key (the one that verified initiator_sig) */
+  initiatorIkPubB64: string;
+  /** Batch C (V-12): the dials carried in the SIGNED request */
+  dials: Partial<DialsInput>;
 }
 
 export interface AcceptedContactSession {
   state: RatchetState;
   fingerprint: string;
-  responderPubJwk: string;
-  responderRatchetPubJwk: string;
+  responderPub: string;
+  responderRatchetPub: string;
   writeSecret: string;
 }
 
-/** Om: responder accepts the one-tap request; session is READY on return. */
-export async function acceptContactSession(token: string, req: ContactRequest, signed = false): Promise<AcceptedContactSession> {
-  let shared = await x25519Ecdh(await x25519ImportPrivSeed(req.spkPrivB64), await x25519ImportPub(req.ekPubB64));
-  let hybrid = false;
-  if (req.pqCt && req.pqPrivB64) {
-    shared = combine(shared, await mlkemDecap(req.pqPrivB64, req.pqCt));
-    hybrid = true;
-  }
+/** Responder accepts the one-tap request; session is READY on return. */
+export async function acceptContactSession(token: string, req: ContactRequest): Promise<AcceptedContactSession> {
+  requirePqCt(req.pqCt, 'contact request');
+  if (!req.pqPrivB64) throw new Error('Post-quantum prekey missing on this device — re-open Vardum to republish it.');
+  if (!req.ikSeedB64) throw new Error('Identity key missing on this device.');
+  const ikSeed = fromB64(req.ikSeedB64);
+  if (ikSeed.length !== 32 || toB64(ed25519.getPublicKey(ikSeed)) !== req.ikPubB64) throw new Error('Identity key mismatch on this device.');
+  const dhSpk = dh(fromB64(req.spkPrivB64), req.ekPubB64);
+  const dhIk = dh(edwardsToMontgomeryPriv(ikSeed), req.ekPubB64);
+  const shared = combine(combine(dhSpk, dhIk), await mlkemDecap(req.pqPrivB64, req.pqCt));
   const rootKey = await deriveRk0(shared, token);
-  // b197: MUST mirror the initiator's signed flag — derive only when opted in,
-  // otherwise the responder demands sigs the initiator never sends.
-  const sig = signed ? await deriveSigPair(rootKey, token) : null;
+  const sig = await deriveSigPairs(rootKey, token, 'responder');
   const writeSecrets = await contactWriteSecrets(rootKey);
-  const initiatorPub = await importPubJwk(req.initiatorP256Jwk);
-  const ratchetPair = await generateEcdhPair();
-  const root1 = await deriveRoot(rootKey, await ecdh(ratchetPair.privateKey, initiatorPub), null);
-  const ikPair = await generateEcdhPair();
-  const ikPubJwk = await exportPubJwk(ikPair.publicKey);
-  let step: { pub: string; priv: string } | null = null;
-  if (hybrid) step = await pqStepPair(); // fail-closed (b118)
-  const fingerprint = await sessionFingerprint(shared);
-  const ratchetPubJwk = await exportPubJwk(ratchetPair.publicKey);
-  const state: RatchetState = {
-    role: 'responder',
-    proto: RATCHET_PROTOCOL_LATEST,
-    seenRemotePubs: new Set(),
-    contact: true,
+  const ratchet = x25519Pair();
+  const root1 = await deriveRoot(rootKey, dh(ratchet.priv, req.initiatorSessionPub), null);
+  const hs = x25519Pair();
+  const step = await pqStepPair();
+  const dialsStr = canonicalDials(req.dials);
+  const fingerprint = await contactFingerprint(
+    token, req.initiatorIkPubB64, req.ikPubB64, req.ekPubB64, req.spkPubB64, req.pqPubB64, req.pqCt,
+    req.initiatorSessionPub, hs.pub, ratchet.pub, dialsStr, await sha256(shared),
+  );
+  const state = emptyState('responder', true, hs);
+  Object.assign(state, {
     ready: true,
     fingerprint,
-    pq: hybrid ? 'hybrid' : 'classical',
-    ikPair,
-    ikPubJwk,
-    bound: { initiatorPubJwk: req.initiatorP256Jwk, responderPubJwk: ikPubJwk, responderRatchetPubJwk: ratchetPubJwk },
-    pqPriv: null,
-    pqStepPriv: step?.priv ?? null,
-    pqStepPub: step?.pub ?? null,
-    pendingPqCt: null,
-    ppSecret: null,
+    dials: dialsStr,
+    bound: { initiatorPub: req.initiatorSessionPub, responderPub: hs.pub, responderRatchetPub: ratchet.pub },
+    hsPriv: new Uint8Array(32), // Batch H (R6-1-07): used above, never again
+    pqStepPriv: step.priv,
+    pqStepPub: step.pub,
     writeSecret: writeSecrets.responder,
-    signed,
-    sigPrivB64: sig?.privB64 ?? null,
-    sigPubB64: sig?.pubB64 ?? null,
-    ratchetPair,
-    ratchetPubJwk,
-    remoteRatchetPubJwk: req.initiatorP256Jwk,
-    myPubs: new Set<string>(),
+    sigPrivB64: sig.privB64,
+    sigPubB64: sig.pubB64,
+    ratchetPriv: ratchet.priv,
+    ratchetPub: ratchet.pub,
+    remoteRatchetPub: req.initiatorSessionPub,
     rootKey: root1.rk,
     sendChain: root1.ck,
-    recvChain: null,
-    sendCount: 0,
-    prevSendCount: 0,
-    recvCount: 0,
-    processedIds: new Set<string>(),
-    skipped: new Map(),
-  };
-  state.myPubs.add(state.ratchetPubJwk);
-  return { state, fingerprint, responderPubJwk: ikPubJwk, responderRatchetPubJwk: ratchetPubJwk, writeSecret: writeSecrets.responder };
+  });
+  state.myPubs.add(ratchet.pub);
+  return { state, fingerprint, responderPub: hs.pub, responderRatchetPub: ratchet.pub, writeSecret: writeSecrets.responder };
 }
 
-// ---------- initiator completes the handshake (Zp, strict branch) ----------
+// ---------- initiator completes the handshake ----------
 
 /** Completes the handshake from the responder's join material; returns the converged fingerprint. */
 export async function completeHandshake(
   state: RatchetState,
   token: string,
-  responderPubJwk: string,
-  responderRatchetPubJwk: string,
+  responderPub: string,
+  responderRatchetPub: string,
   responderPqCt: string | null,
 ): Promise<string> {
   if (state.role !== 'initiator') throw new Error('Only the initiator completes the handshake');
   if (state.ready) return state.fingerprint!;
 
-  // contact branch (am): root was already derived at create from the peer's SPK;
-  // complete against the responder's ratchet pub. Fingerprint is NOT recomputed.
+  // Batch C (V-12): the initiator binds its OWN dials, never the relay row's
+  if (!state.dials) throw new Error('Handshake state incomplete — start a new chat.');
+  let rootKey: Uint8Array;
   if (state.contact) {
-    // b197 (audit H-1): derive the signing pair from the pre-rotation contact
-    // root BEFORE the root chain below overwrites state.rootKey.
-    if (state.signed && !state.sigPrivB64) {
-      const sig = await deriveSigPair(state.rootKey, token);
-      state.sigPrivB64 = sig.privB64;
-      state.sigPubB64 = sig.pubB64;
-    }
-    const responderRatchetPub = await importPubJwk(responderRatchetPubJwk);
-    const root1 = await deriveRoot(state.rootKey, await ecdh(state.ikPair.privateKey, responderRatchetPub), null);
-    const ratchetPair = await generateEcdhPair();
-    const root2 = await deriveRoot(root1.rk, await ecdh(ratchetPair.privateKey, responderRatchetPub), null);
-    state.rootKey = root2.rk;
-    state.ratchetPair = ratchetPair;
-    state.ratchetPubJwk = await exportPubJwk(ratchetPair.publicKey);
-    state.remoteRatchetPubJwk = responderRatchetPubJwk;
-    state.bound = { initiatorPubJwk: state.ikPubJwk, responderPubJwk, responderRatchetPubJwk };
-    state.sendChain = root2.ck;
-    state.recvChain = root1.ck;
-    state.sendCount = 0;
-    state.prevSendCount = 0;
-    state.recvCount = 0;
-    state.skipped = new Map();
-    state.processedIds = new Set<string>();
-    state.ready = true;
-    state.myPubs = new Set([state.ratchetPubJwk]);
-    let step: { pub: string; priv: string } | null = null;
-    if (state.pq === 'hybrid') step = await pqStepPair(); // fail-closed (b118)
-    state.pqStepPriv = step?.priv ?? null;
-    state.pqStepPub = step?.pub ?? null;
-    state.pendingPqCt = null;
-    return state.fingerprint!;
-  }
-
-  const responderPub = await importPubJwk(responderPubJwk);
-  const responderRatchetPub = await importPubJwk(responderRatchetPubJwk);
-
-  const dh = await ecdh(state.ikPair.privateKey, responderPub);
-  let shared = dh;
-  let stepPq: { pub: string; priv: string } | null = null;
-  if (state.pq === 'hybrid' && state.pqPriv && responderPqCt) {
-    shared = combine(dh, await mlkemDecap(state.pqPriv, responderPqCt));
-    try { stepPq = await mlkemKeypair(); } catch { stepPq = null; }
-  }
-  shared = combine(shared, state.ppSecret ?? new Uint8Array());
-  const rk0 = await deriveRk0(shared, token);
-  // b197 (audit H-1): initiator-side signing pair, derived from the same rk0
-  // the responder derived theirs from — both sides converge on one keypair.
-  if (state.signed && !state.sigPrivB64) {
-    const sig = await deriveSigPair(rk0, token);
+    // contact: root (and the signing pairs) were derived at create from the
+    // peer's signed prekeys; the transcript is finished here (NF-7).
+    const cp = state.contactPending;
+    if (!cp) throw new Error('Handshake state incomplete — start a new chat.');
+    rootKey = state.rootKey;
+    state.fingerprint = await contactFingerprint(
+      token, cp.initiatorIkPub, cp.responderIkPub, cp.ekPub, cp.spkPub, cp.pqPub, cp.pqCt,
+      state.hsPub, responderPub, responderRatchetPub, state.dials, fromB64(cp.sharedHash),
+    );
+    state.contactPending = null;
+  } else {
+    requirePqCt(responderPqCt, 'invite join');
+    if (!state.pqPriv || !state.pqPub || !state.ppSecret) throw new Error('Handshake state incomplete — ask for a fresh invite.');
+    const shared = combine(combine(dh(state.hsPriv, responderPub), await mlkemDecap(state.pqPriv, responderPqCt as string)), state.ppSecret);
+    rootKey = await deriveRk0(shared, token);
+    const sig = await deriveSigPairs(rootKey, token, 'initiator');
     state.sigPrivB64 = sig.privB64;
     state.sigPubB64 = sig.pubB64;
+    state.fingerprint = await inviteFingerprint(token, state.hsPub, responderPub, responderRatchetPub, state.pqPub, responderPqCt as string, state.dials, shared);
   }
-  const root1 = await deriveRoot(rk0, await ecdh(state.ikPair.privateKey, responderRatchetPub), null);
-  const ratchetPair = await generateEcdhPair();
-  const root2 = await deriveRoot(root1.rk, await ecdh(ratchetPair.privateKey, responderRatchetPub), null);
+  const step = await pqStepPair();
+  const root1 = await deriveRoot(rootKey, dh(state.hsPriv, responderRatchetPub), null);
+  const ratchet = x25519Pair();
+  const root2 = await deriveRoot(root1.rk, dh(ratchet.priv, responderRatchetPub), null);
 
   state.rootKey = root2.rk;
-  state.ratchetPair = ratchetPair;
-  state.ratchetPubJwk = await exportPubJwk(ratchetPair.publicKey);
-  state.remoteRatchetPubJwk = responderRatchetPubJwk;
-  state.bound = { initiatorPubJwk: state.ikPubJwk, responderPubJwk, responderRatchetPubJwk };
+  state.ratchetPriv = ratchet.priv;
+  state.ratchetPub = ratchet.pub;
+  state.remoteRatchetPub = responderRatchetPub;
+  state.bound = { initiatorPub: state.hsPub, responderPub, responderRatchetPub };
   state.sendChain = root2.ck;
   state.recvChain = root1.ck;
   state.sendCount = 0;
@@ -673,66 +673,62 @@ export async function completeHandshake(
   state.recvCount = 0;
   state.skipped = new Map();
   state.processedIds = new Set<string>();
-  state.fingerprint = await sessionFingerprint(shared);
-  state.ready = true;
-  state.pqStepPriv = stepPq?.priv ?? null;
-  state.pqStepPub = stepPq?.pub ?? null;
+  state.myPubs = new Set([ratchet.pub]);
+  state.pqStepPriv = step.priv;
+  state.pqStepPub = step.pub;
   state.pendingPqCt = null;
-  state.myPubs = new Set([state.ratchetPubJwk]);
-  return state.fingerprint;
+  // the handshake ML-KEM key and link secret are single-use: drop them
+  state.pqPriv = null;
+  state.ppSecret = null;
+  // Batch H (round-6 review R6-1-07): the handshake DH key is single-use too — it was
+  // kept (and saved, and moved in transfers) for the life of the chat
+  state.hsPriv = new Uint8Array(32);
+  state.ready = true;
+  return state.fingerprint!;
 }
 
-// ---------- ratchet step (Jp) ----------
+// ---------- ratchet step ----------
 
 async function stepRatchet(state: RatchetState, header: EnvelopeHeader): Promise<void> {
-  if (header.rp === state.ratchetPubJwk) return; // own pub echoed (multi-tab guard) — no step
+  if (header.rp === state.ratchetPub) return; // own pub echoed (multi-tab guard) — no step
   if (state.seenRemotePubs.has(header.rp)) {
     throw new Error('Stale ratchet header — this message belongs to an already-replaced key epoch.');
   }
-  // b197 (audit H-1): verify the rotation signature BEFORE any DH work or
-  // state mutation. Runs on the isolated candidate state in decryptMessage,
-  // so a rejected header changes nothing (same atomicity rule as below).
-  verifyRatchetPubSig(state, header.rp, header.sig);
-  const pub = await importPubJwk(header.rp);
+  // verify BEFORE any DH work or state mutation (runs on the candidate state)
+  verifyRatchetPubSig(state, header);
+  requirePqPub(header.pq, 'ratchet step');
   let pqRekeySecret: Uint8Array | null = null;
-  if (state.pq === 'hybrid' && state.pqStepPriv && header.pqct) {
-    pqRekeySecret = await mlkemDecap(state.pqStepPriv, header.pqct);
+  if (header.pqct) {
+    if (!state.pqStepPriv) throw new Error('Post-quantum step key missing — the session is desynchronised.');
+    pqRekeySecret = await mlkemDecap(state.pqStepPriv, requirePqCt(header.pqct, 'ratchet step'));
   }
-  let pqAnswerSecret: Uint8Array | null = null;
-  if (state.pq === 'hybrid' && header.pq) {
-    const { ct, secret } = await mlkemEncap(header.pq);
-    pqAnswerSecret = secret;
-    state.pendingPqCt = ct;
-  }
-  const rootA = await deriveRoot(state.rootKey, await ecdh(state.ratchetPair.privateKey, pub), pqRekeySecret);
-  const fresh = await generateEcdhPair();
-  const rootB = await deriveRoot(rootA.rk, await ecdh(fresh.privateKey, pub), pqAnswerSecret);
+  const { ct, secret: pqAnswerSecret } = await mlkemEncap(header.pq as string);
+  state.pendingPqCt = ct;
+  if (!state.ratchetPriv) throw new Error('No ratchet key for this session.');
+  const rootA = await deriveRoot(state.rootKey, dh(state.ratchetPriv, header.rp), pqRekeySecret);
+  const fresh = x25519Pair();
+  const rootB = await deriveRoot(rootA.rk, dh(fresh.priv, header.rp), pqAnswerSecret);
+  const step = await pqStepPair();
   state.prevSendCount = state.sendCount;
   state.sendCount = 0;
   state.recvCount = 0;
   state.rootKey = rootB.rk;
-  state.ratchetPair = fresh;
-  state.ratchetPubJwk = await exportPubJwk(fresh.publicKey);
-  if (state.remoteRatchetPubJwk) {
-    state.seenRemotePubs.add(state.remoteRatchetPubJwk);
+  state.ratchetPriv = fresh.priv;
+  state.ratchetPub = fresh.pub;
+  if (state.remoteRatchetPub) {
+    state.seenRemotePubs.add(state.remoteRatchetPub);
     while (state.seenRemotePubs.size > MAX_SEEN_PUBS) state.seenRemotePubs.delete(state.seenRemotePubs.keys().next().value as string);
   }
-  state.remoteRatchetPubJwk = header.rp;
+  state.remoteRatchetPub = header.rp;
   state.sendChain = rootB.ck;
   state.recvChain = rootA.ck;
-  state.myPubs.add(state.ratchetPubJwk);
-  // b197-r4: bound myPubs growth — one pub per rotation, serialized forever
-  // otherwise. 64 epochs of own-echo history is far beyond any realistic
-  // relay reorder window; evicted echoes fail closed via the counter guard.
+  state.myPubs.add(state.ratchetPub);
   while (state.myPubs.size > MAX_MY_PUBS) state.myPubs.delete(state.myPubs.keys().next().value as string);
-  if (state.pq === 'hybrid') {
-    const step = await pqStepPair(); // fail-closed (b118)
-    state.pqStepPriv = step.priv;
-    state.pqStepPub = step.pub;
-  }
+  state.pqStepPriv = step.priv;
+  state.pqStepPub = step.pub;
 }
 
-// ---------- chain catch-up (qp) ----------
+// ---------- chain catch-up ----------
 
 async function messageKeyFor(state: RatchetState, n: number): Promise<Uint8Array> {
   if (!state.recvChain) throw new Error('No receive chain for this message');
@@ -742,7 +738,7 @@ async function messageKeyFor(state: RatchetState, n: number): Promise<Uint8Array
   while (state.recvCount < n) {
     const step = await advanceChain(state.recvChain);
     state.recvChain = step.ck;
-    storeSkipped(state, state.remoteRatchetPubJwk!, state.recvCount, step.mk);
+    storeSkipped(state, state.remoteRatchetPub!, state.recvCount, step.mk);
     state.recvCount += 1;
   }
   const step = await advanceChain(state.recvChain);
@@ -751,13 +747,12 @@ async function messageKeyFor(state: RatchetState, n: number): Promise<Uint8Array
   return step.mk;
 }
 
-// ---------- per-message pseudonym (Ru in the web reference) ----------
+// ---------- per-message pseudonym ----------
 
 /**
  * SPEC §4: sender_client_id = 'a' + lowercaseHex(SHA-256(UTF8(rp_string)))
  * from the FIRST 6 BYTES of the digest (12 hex chars, 13 total).
- * The relay verifies this against the envelope header — the raw client_id
- * must NEVER travel as sender_client_id (native<->native hid this).
+ * The relay verifies this against the envelope header.
  */
 export async function senderPseudonym(headerJson: string): Promise<string> {
   const rp = (JSON.parse(headerJson) as { rp?: string }).rp || '';
@@ -765,67 +760,41 @@ export async function senderPseudonym(headerJson: string): Promise<string> {
   return 'a' + [...h.slice(0, 6)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-// ---------- PQ step keys (fail-closed) ----------
-
-/**
- * PQ step-key generation (staged fix, 24 Sep 2026 — owner fail-closed decision).
- * A hybrid session must NEVER silently downgrade to classical: if ML-KEM key
- * generation fails, the operation aborts loudly and the caller retries. The
- * message/handshake is never sent without its post-quantum binding.
- */
-async function pqStepPair(): Promise<{ pub: string; priv: string }> {
-  try {
-    return await mlkemKeypair();
-  } catch (e) {
-    throw new Error('Post-quantum key generation failed — send aborted to avoid a security downgrade. Please retry.');
-  }
-}
-
-// ---------- send ($p) ----------
+// ---------- send ----------
 
 /** Returns the envelope to submit to the relay. */
 export async function encryptMessage(state: RatchetState, text: string, opts: { cover?: boolean; envelopeId?: string } = {}): Promise<Envelope> {
   if (!state.ready) throw new Error('Session keys not established. The session may have ended or locked.');
-  if (state.pq === 'hybrid' && !state.pqStepPub) {
-    const step = await pqStepPair(); // fail-closed (b118)
+  if (!state.pqStepPub) {
+    const step = await pqStepPair();
     state.pqStepPriv = step.priv;
     state.pqStepPub = step.pub;
   }
   const step = await advanceChain(state.sendChain!);
   state.sendChain = step.ck;
   const header: EnvelopeHeader = {
-    v: state.proto || RATCHET_VERSION,
-    rp: state.ratchetPubJwk,
+    v: state.proto,
+    rp: state.ratchetPub,
     pn: state.prevSendCount,
     n: state.sendCount,
+    pq: state.pqStepPub!,
   };
-  // b197 (audit H-1): signed sessions authenticate every ratchet pub in every
-  // header; receivers verify at rotation time.
-  const sig = signRatchetPub(state, state.ratchetPubJwk);
-  if (sig) header.sig = sig;
-  if (state.pq === 'hybrid' && state.pqStepPub) {
-    header.pq = state.pqStepPub;
-    // b197-r1 (audit follow-up): a b197 draft cleared pendingPqCt after first
-    // send ("consume-once"). REVERTED — the b185 DR vector suite caught a real
-    // desync: the re-send IS the delivery mechanism for the PQ re-key. If the
-    // message carrying the ct is lost/held/reordered, the peer's next rotation
-    // would fold NOTHING and the chains diverge (AES auth failure). The ct is
-    // re-sent until the sender's NEXT rotation replaces it; a stale ct decaps
-    // to a harmless deterministic pseudorandom secret on the peer's CURRENT
-    // step key. TRUE per-epoch PQ freshness needs a consumption-ack in the
-    // header (protocol change, needs web parity) — tracked as audit follow-up.
-    if (state.pendingPqCt) header.pqct = state.pendingPqCt;
-  }
+  // The ct is re-sent until the sender's NEXT rotation replaces it: the
+  // re-send IS the delivery mechanism for the PQ re-key (a lost first copy
+  // must not desync the chains). A stale ct decaps to a harmless pseudorandom
+  // secret on the peer's current step key.
+  if (state.pendingPqCt) header.pqct = state.pendingPqCt;
+  header.sig = signRatchetPub(state, header.rp, header.pq);
   state.sendCount += 1;
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const aad = utf8(JSON.stringify(header));
+  const headerStr = JSON.stringify(header);
   const key = await importAesKey(step.mk);
   const padded = padPlaintext(text, !!opts.cover);
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv as BufferSource, additionalData: aad as BufferSource }, key, padded as BufferSource);
-  return { ciphertext: toB64(new Uint8Array(ct)), iv: toB64(iv), header: JSON.stringify(header), byteLength: padded.length };
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv as BufferSource, additionalData: utf8(headerStr) as BufferSource }, key, padded as BufferSource);
+  return { ciphertext: toB64(new Uint8Array(ct)), iv: toB64(iv), header: headerStr, byteLength: padded.length };
 }
 
-// ---------- receive (em) ----------
+// ---------- receive ----------
 
 export interface DecryptedMessage { text: string; cover: boolean }
 
@@ -834,25 +803,12 @@ export async function decryptMessage(state: RatchetState, envelope: Envelope, en
   if (!state.ready) throw new Error('Session keys not established. The session may have ended or locked.');
   const header = JSON.parse(envelope.header) as EnvelopeHeader;
   if (!(RATCHET_PROTOCOL_SUPPORTED as readonly string[]).includes(header.v)) throw new Error('Unsupported protocol version in message header.');
-  // b197-r4 (stress hardening): an envelope whose header rp is one of OUR pubs
-  // is our own echo — never decrypt it locally. The sync layer filters these
-  // via myPubs before decrypt (chat.ts); this engine-level guard makes the
-  // ratchet itself immune to a bypassed filter consuming a REAL message key
-  // (counter drift -> desync). Same contract as the replay guard: null =
-  // "nothing to decrypt", callers already handle it.
+  // an envelope whose header rp is one of OUR pubs is our own echo
   if (state.myPubs.has(header.rp)) return null;
-  if (envelopeId) {
-    if (state.processedIds.has(envelopeId)) return null; // idempotent replay guard
-    // NOTE (audit fix, Sept 19): mark processed ONLY AFTER a successful decrypt.
-    // Marking before meant a single failed/Corrupted envelope was permanently
-    // invisible on every later poll (replay guard swallowed the retry) — a
-    // silent one-message loss. A failing envelope now retries each poll,
-    // deterministically and state-safely (messageKeyFor never rewinds).
-  }
+  if (envelopeId && state.processedIds.has(envelopeId)) return null; // idempotent replay guard
   // Work on an isolated candidate state: a malformed envelope must not consume
   // skipped keys, advance receive counters, or rotate root keys before AEAD
-  // authentication succeeds. Sets and inner maps are copied because helpers
-  // mutate them in place. Their sizes are bounded by the protocol limits.
+  // authentication succeeds.
   const candidate: RatchetState = {
     ...state,
     seenRemotePubs: new Set(state.seenRemotePubs),
@@ -862,20 +818,21 @@ export async function decryptMessage(state: RatchetState, envelope: Envelope, en
   };
   let mk = takeSkipped(candidate, header);
   if (!mk) {
-    if (header.rp !== state.remoteRatchetPubJwk) {
-      // b185: spec DHRatchet — drain the old receive chain (up to header.pn)
-      // into the skipped-key store BEFORE rotating, so old-epoch stragglers
-      // remain decryptable. Runs on the isolated candidate state, so a
-      // malformed envelope changes nothing (same atomicity rule as below).
+    if (header.rp !== state.remoteRatchetPub) {
+      // Batch D (D-12, RV-21): authenticate the rotation BEFORE any chain work —
+      // a forged header must not make this device derive up to MAX_COUNTER_GAP keys
+      if (header.rp !== candidate.ratchetPub) {
+        if (candidate.seenRemotePubs.has(header.rp)) throw new Error('Stale ratchet header — this message belongs to an already-replaced key epoch.');
+        verifyRatchetPubSig(candidate, header);
+      }
       await skipOldChainBeforeRotation(candidate, header.pn);
       await stepRatchet(candidate, header);
     }
     mk = await messageKeyFor(candidate, header.n);
   }
   const key = await importAesKey(mk);
-  const aad = utf8(envelope.header);
   const pt = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: fromB64(envelope.iv) as BufferSource, additionalData: aad as BufferSource },
+    { name: 'AES-GCM', iv: fromB64(envelope.iv) as BufferSource, additionalData: utf8(envelope.header) as BufferSource },
     key,
     fromB64(envelope.ciphertext) as BufferSource,
   );
@@ -888,34 +845,33 @@ export async function decryptMessage(state: RatchetState, envelope: Envelope, en
   return { text, cover };
 }
 
-// ---------- persistence (serialize / deserialize) ----------
-// Mirrors the web bundle's xp() snapshot: CryptoKeys cannot cross a storage
-// boundary, so pairs serialize as JWK private keys; raw secrets as b64.
+// ---------- persistence ----------
 
 export interface RatchetStateSerialized {
+  proto: string;
   role: SessionRole;
-  proto?: string;
-  seenRemotePubs?: string[];
+  seenRemotePubs: string[];
   contact: boolean;
   ready: boolean;
   fingerprint: string | null;
-  pq: 'hybrid' | 'classical';
+  pq: 'hybrid';
   writeSecret: string | null;
-  ikPubJwk: string;
-  ikPrivJwk: string;
+  hsPub: string;
+  hsPrivB64: string;
   bound: RatchetState['bound'];
+  pqPub: string | null;
   pqPriv: string | null;
   pqStepPriv: string | null;
   pqStepPub: string | null;
   pendingPqCt: string | null;
-  /** b197 (audit H-1): signed-rotation fields — optional so web-bundle-era state loads unchanged. */
-  signed?: boolean;
-  sigPrivB64?: string | null;
-  sigPubB64?: string | null;
+  sigPrivB64: string | null;
+  sigPubB64: string | null;
+  dials: string | null;
+  contactPending: RatchetState['contactPending'];
   ppSecretB64: string | null;
-  ratchetPubJwk: string;
-  ratchetPrivJwk: string;
-  remoteRatchetPubJwk: string | null;
+  ratchetPub: string;
+  ratchetPrivB64: string | null;
+  remoteRatchetPub: string | null;
   myPubs: string[];
   rootKeyB64: string;
   sendChainB64: string | null;
@@ -927,38 +883,37 @@ export interface RatchetStateSerialized {
   skipped: Array<[string, Array<[number, string]>]>;
 }
 
-async function exportPrivJwk(key: CryptoKey): Promise<string> {
-  return JSON.stringify(await crypto.subtle.exportKey('jwk', key));
+/** True when a stored session predates the current protocol (b54 hard cut; Batch C: veil-ratchet-6). */
+export function isLegacySessionState(data: unknown): boolean {
+  return !!data && typeof data === 'object' && (data as { proto?: unknown }).proto !== RATCHET_PROTOCOL_LATEST;
 }
-
 
 export async function serializeRatchetState(state: RatchetState): Promise<RatchetStateSerialized> {
   return {
-    role: state.role,
     proto: state.proto,
+    role: state.role,
     seenRemotePubs: [...state.seenRemotePubs],
     contact: state.contact,
     ready: state.ready,
     fingerprint: state.fingerprint,
     pq: state.pq,
     writeSecret: state.writeSecret,
-    ikPubJwk: state.ikPubJwk,
-    ikPrivJwk: await exportPrivJwk(state.ikPair.privateKey),
+    hsPub: state.hsPub,
+    hsPrivB64: toB64(state.hsPriv),
     bound: state.bound,
+    pqPub: state.pqPub,
     pqPriv: state.pqPriv,
     pqStepPriv: state.pqStepPriv,
     pqStepPub: state.pqStepPub,
     pendingPqCt: state.pendingPqCt,
-    // b197: signed-rotation fields are written ONLY when set — unsigned
-    // sessions serialize byte-identically to pre-b197 state (frozen DR fixture
-    // byte-equality and web-bundle state snapshots stay valid).
-    ...(state.signed ? { signed: true } : {}),
-    ...(state.sigPrivB64 ? { sigPrivB64: state.sigPrivB64 } : {}),
-    ...(state.sigPubB64 ? { sigPubB64: state.sigPubB64 } : {}),
+    sigPrivB64: state.sigPrivB64,
+    sigPubB64: state.sigPubB64,
+    dials: state.dials,
+    contactPending: state.contactPending,
     ppSecretB64: state.ppSecret ? toB64(state.ppSecret) : null,
-    ratchetPubJwk: state.ratchetPubJwk,
-    ratchetPrivJwk: state.ratchetPair && state.ratchetPair.privateKey ? await exportPrivJwk(state.ratchetPair.privateKey) : '',
-    remoteRatchetPubJwk: state.remoteRatchetPubJwk,
+    ratchetPub: state.ratchetPub,
+    ratchetPrivB64: state.ratchetPriv ? toB64(state.ratchetPriv) : null,
+    remoteRatchetPub: state.remoteRatchetPub,
     myPubs: [...state.myPubs],
     rootKeyB64: toB64(state.rootKey),
     sendChainB64: state.sendChain ? toB64(state.sendChain) : null,
@@ -972,44 +927,33 @@ export async function serializeRatchetState(state: RatchetState): Promise<Ratche
 }
 
 export async function deserializeRatchetState(data: RatchetStateSerialized): Promise<RatchetState> {
-  const ikPair = await (async () => {
-    const priv = await crypto.subtle.importKey('jwk', JSON.parse(data.ikPrivJwk), { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
-    // public key is recoverable from the private JWK (crv/xy present)
-    const jwk = JSON.parse(data.ikPrivJwk);
-    delete jwk.d;
-    const pub = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
-    return { privateKey: priv, publicKey: pub } as CryptoKeyPair;
-  })();
-  const ratchetPair = data.ratchetPrivJwk ? await (async () => {
-    const priv = await crypto.subtle.importKey('jwk', JSON.parse(data.ratchetPrivJwk), { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
-    const jwk = JSON.parse(data.ratchetPrivJwk);
-    delete jwk.d;
-    const pub = await crypto.subtle.importKey('jwk', jwk, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
-    return { privateKey: priv, publicKey: pub } as CryptoKeyPair;
-  })() : (null as unknown as CryptoKeyPair);
+  if (isLegacySessionState(data) || data.pq !== 'hybrid') throw new LegacySessionError();
   return {
     role: data.role,
-    proto: (data as unknown as Record<string, unknown>).proto as string ?? RATCHET_VERSION,
-    seenRemotePubs: new Set(((data as unknown as Record<string, unknown>).seenRemotePubs as string[] | undefined) ?? []),
+    proto: data.proto,
+    seenRemotePubs: new Set(data.seenRemotePubs ?? []),
     contact: data.contact,
     ready: data.ready,
     fingerprint: data.fingerprint,
-    pq: data.pq,
+    pq: 'hybrid',
     writeSecret: data.writeSecret ?? null,
-    ikPair,
-    ikPubJwk: data.ikPubJwk,
+    // Batch H (R6-1-07): a completed chat needs no handshake key; older saves drop it here
+    hsPriv: data.ready ? new Uint8Array(32) : fromB64(data.hsPrivB64),
+    hsPub: data.hsPub,
     bound: data.bound,
+    pqPub: data.pqPub ?? null,
     pqPriv: data.pqPriv,
     pqStepPriv: data.pqStepPriv,
     pqStepPub: data.pqStepPub,
     pendingPqCt: data.pendingPqCt,
-    signed: (data as unknown as Record<string, unknown>).signed === true,
-    sigPrivB64: ((data as unknown as Record<string, unknown>).sigPrivB64 as string | null | undefined) ?? null,
-    sigPubB64: ((data as unknown as Record<string, unknown>).sigPubB64 as string | null | undefined) ?? null,
+    sigPrivB64: data.sigPrivB64 ?? null,
+    sigPubB64: data.sigPubB64 ?? null,
+    dials: data.dials ?? null,
+    contactPending: data.contactPending ?? null,
     ppSecret: data.ppSecretB64 ? fromB64(data.ppSecretB64) : null,
-    ratchetPair,
-    ratchetPubJwk: data.ratchetPubJwk,
-    remoteRatchetPubJwk: data.remoteRatchetPubJwk,
+    ratchetPriv: data.ratchetPrivB64 ? fromB64(data.ratchetPrivB64) : null,
+    ratchetPub: data.ratchetPub,
+    remoteRatchetPub: data.remoteRatchetPub,
     myPubs: new Set(data.myPubs),
     rootKey: fromB64(data.rootKeyB64),
     sendChain: data.sendChainB64 ? fromB64(data.sendChainB64) : null,

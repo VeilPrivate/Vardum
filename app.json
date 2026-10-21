@@ -1,22 +1,21 @@
 {
   "expo": {
-    "name": "VEIL",
+    "name": "Vardum",
     "slug": "veil-messaging",
     "version": "1.0.0",
     "orientation": "portrait",
-    "userInterfaceStyle": "automatic",
+    "userInterfaceStyle": "dark",
     "ios": {
       "supportsTablet": false,
       "infoPlist": {
         "UIBackgroundModes": [
           "remote-notification"
         ],
-        "NSFaceIDUsageDescription": "VEIL uses Face ID to unlock your encrypted messages on this device. Your biometrics never leave the device.",
-        "NSMicrophoneUsageDescription": "VEIL uses the microphone only during end-to-end encrypted calls. Audio never leaves your device unencrypted.",
+        "NSFaceIDUsageDescription": "Vardum uses Face ID to unlock your encrypted messages on this device. Your biometrics never leave the device.",
+        "NSMicrophoneUsageDescription": "Vardum uses the microphone only during end-to-end encrypted calls. Audio never leaves your device unencrypted.",
         "ITSAppUsesNonExemptEncryption": false
       },
       "bundleIdentifier": "au.com.mattthemagicalmentalist.veil",
-      "buildNumber": "186",
       "privacyManifest": {
         "NSPrivacyAccessedAPITypes": [
           {
@@ -32,33 +31,89 @@
       ]
     },
     "android": {
+      "package": "app.tryvardum.android",
+      "versionCode": 68,
       "allowBackup": false,
-      "softwareKeyboardLayoutMode": "pan"
+      "softwareKeyboardLayoutMode": "pan",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/android/adaptive-foreground.png",
+        "monochromeImage": "./assets/android/adaptive-monochrome.png",
+        "backgroundColor": "#0B0B0F"
+      },
+      "permissions": [
+        "RECORD_AUDIO",
+        "MODIFY_AUDIO_SETTINGS",
+        "BLUETOOTH_CONNECT",
+        "VIBRATE",
+        "USE_BIOMETRIC",
+        "USE_FINGERPRINT"
+      ],
+      "blockedPermissions": [
+        "android.permission.SYSTEM_ALERT_WINDOW"
+      ],
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "https",
+              "host": "tryveil.app",
+              "path": "/"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ]
     },
     "plugins": [
       [
         "expo-image-picker",
         {
-          "photosPermission": "VEIL uses the photo library only to attach images you choose to your encrypted messages. Photos never leave the device unencrypted."
+          "photosPermission": "Vardum uses the photo library only to attach images you choose to your encrypted messages. Photos never leave the device unencrypted."
         }
       ],
       [
         "expo-av",
         {
-          "microphonePermission": "VEIL uses the microphone only when you tap the mic to record a voice note. The recording is encrypted on this device before it is sent."
+          "microphonePermission": "Vardum uses the microphone only when you tap the mic to record a voice note. The recording is encrypted on this device before it is sent."
         }
       ],
       [
         "expo-media-library",
         {
-          "savePhotosPermission": "VEIL saves an image to Photos only when you tap Save to Photos on it. Nothing is saved automatically.",
+          "savePhotosPermission": "Vardum saves an image to Photos only when you tap Save to Photos on it. Nothing is saved automatically.",
           "isAccessMediaLocationEnabled": false
         }
       ],
       [
         "expo-notifications",
         {
-          "mode": "production"
+          "mode": "production",
+          "icon": "./assets/android/notification-icon.png",
+          "color": "#20D9C2"
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Vardum uses the camera only to scan a Vardum QR code when you tap Scan. Nothing is recorded, saved or sent.",
+          "microphonePermission": false,
+          "recordAudioAndroid": false
+        }
+      ],
+      "./plugins/with-kotlin-plugin-version",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "compileSdkVersion": 36,
+            "targetSdkVersion": 36,
+            "buildToolsVersion": "36.0.0"
+          }
         }
       ]
     ],
@@ -66,15 +121,14 @@
     "splash": {
       "image": "./assets/splash-1024.png",
       "resizeMode": "contain",
-      "backgroundColor": "#0B1018"
+      "backgroundColor": "#0B0B0F"
     },
     "newArchEnabled": false,
     "owner": "veilprivacys-team",
     "extra": {
       "eas": {
         "projectId": "e0298236-a0f0-4a29-b486-f14cc8577545"
-      },
-      "veilPatch": "b196-r8"
+      }
     },
     "scheme": "veil"
   }

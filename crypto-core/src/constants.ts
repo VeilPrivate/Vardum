@@ -1,15 +1,18 @@
 /**
- * @veil/crypto-core — protocol constants, extracted from the live web bundle
- * (index-ygJsbHvt.js). These MUST NOT drift: the web bundle is the reference
- * implementation until an explicit protocol bump (veil-ratchet-3 -> -4).
+ * @veil/crypto-core — protocol constants. These MUST NOT drift: any change is
+ * a protocol bump.
  */
 
-export const RATCHET_VERSION = 'veil-ratchet-3' as const; // LEGACY fallback only (deserializeRatchetState defaulting for pre-proto-field sessions). New sessions always stamp RATCHET_PROTOCOL_LATEST at creation (createSession/joinSession/completeHandshake) -- this constant never governs a live session's wire tag.
-export const RATCHET_PROTOCOL_LATEST = 'veil-ratchet-4' as const;
-export const RATCHET_PROTOCOL_SUPPORTED = ['veil-ratchet-3', 'veil-ratchet-4'] as const;
+/** Batch C: veil-ratchet-6 is the ONLY supported 1:1 protocol. Hard cut —
+ *  older sessions (ratchet-3/-4: P-256, optional PQ; ratchet-5: no responder-IK
+ *  term, shared signing key, dials outside the transcript) are refused on load
+ *  and ended by the app's one-time migration. */
+export const RATCHET_PROTOCOL_LATEST = 'veil-ratchet-6' as const;
+export const RATCHET_VERSION = RATCHET_PROTOCOL_LATEST;
+export const RATCHET_PROTOCOL_SUPPORTED = [RATCHET_PROTOCOL_LATEST] as const;
 
 export const RATCHET_ENGINE_LABEL =
-  'Double Ratchet — hybrid ECDH P-256 + ML-KEM-768 (FIPS 203), handshake AND per-step PQ re-key · HKDF-SHA256 · AES-GCM-256 · padded buckets · cover traffic' as const;
+  'Double Ratchet — hybrid X25519 + ML-KEM-768 (FIPS 203), signed PQ prekey, PQ mandatory, per-step PQ re-key, signed ratchet keys · HKDF-SHA256 · AES-GCM-256 · padded buckets · cover traffic' as const;
 
 /** Padded plaintext buckets (bytes). Anything larger throws in the web app. */
 export const PADDED_BUCKETS: readonly number[] = [1024, 4096];
@@ -24,23 +27,27 @@ export const BIP39_WORDS = 24;
 /** HKDF info strings (extracted from bundle). */
 export const HKDF_INFO_IDENTITY_ED25519 = 'veil-identity-ed25519' as const;
 
-/** 64-byte root/chain derivation in Pp: info = `veil-ratchet-3/rk` -> {rk, ck}. */
-export const ROOT_KEY_INFO = 'veil-ratchet-3/rk' as const;
-/** Handshake "rk0" derivation in Wp: HKDF(shared, salt=`veil-ratchet-3:<token>`, info=`rk0`, 32). */
+/** 64-byte root/chain derivation (KDF_RK): info = `vardum-ratchet-6/rk` -> {rk, ck}. */
+export const ROOT_KEY_INFO = 'vardum-ratchet-6/rk' as const;
+/** Handshake root: HKDF(shared, salt=`vardum-ratchet-6:<token>`, info=`rk0`, 32). */
+export const RK0_SALT_PREFIX = 'vardum-ratchet-6:' as const;
 export const RK0_INFO = 'rk0' as const;
-/** Invite prekey secret: salt = `veil-pp:<token>`, info = `pp`. */
+/** Invite link secret (`k=` fragment, never sent to the relay):
+ *  HKDF(k, salt=`vardum-pp-6:<token>`, info=`pp`, 32). */
+export const PP_SALT_PREFIX = 'vardum-pp-6:' as const;
 export const PP_INFO = 'pp' as const;
+/** One-tap contact relay write credentials. */
+export const CONTACT_WRITE_INFO = 'vardum-contact-write-6' as const;
+/** Session fingerprint transcript label (see kdf.ts transcriptFingerprint). */
+export const FINGERPRINT_LABEL = 'vardum-fp-6' as const;
+/** Signed ML-KEM prekey: Ed25519(IK, utf8(PQ_PREKEY_SIG_LABEL) || pq_pub bytes). */
+export const PQ_PREKEY_SIG_LABEL = 'vardum-pq-prekey-v1:' as const;
+/** ML-KEM-768 public key / ciphertext sizes (FIPS 203). */
+export const MLKEM768_PUB_BYTES = 1184;
+export const MLKEM768_CT_BYTES = 1088;
 
-/** b197 (audit H-1): domain string for session-scoped Ed25519 ratchet-key
- *  signatures. The signing keypair is derived from the session's pre-rotation
- *  shared secret with this info string — both peers converge on the same
- *  pair, so every ratchet rotation can be authenticated against splice. */
-export const RATCHET_SIG_INFO = 'veil-ratchet-sig-v1' as const;
-
-/** b197 (audit H-1): MASTER SWITCH for signed ratchet rotations. DEFAULT OFF.
- *  Flip to true ONLY when BOTH native and web clients carry the same
- *  crypto-core (the web bundle shares this file). A signed receiver talking
- *  to an un-upgraded peer rejects the peer's rotations fail-closed — visible
- *  desync, not silent breakage — so this ships as a coordinated flip, never
- *  one-sided. Rollout: flip here + ship both clients + age out old sessions. */
-export const RATCHET_SIGNING_ENABLED = false as const;
+/** Session-scoped Ed25519 ratchet-key signatures (prior finding H-1). The
+ *  signing keypair is derived from the session's handshake root with this
+ *  info string, one pair per direction (Batch C, B9), and every header's
+ *  ratchet pub + PQ step pub is signed. Always on. */
+export const RATCHET_SIG_INFO = 'vardum-ratchet-sig-6' as const;

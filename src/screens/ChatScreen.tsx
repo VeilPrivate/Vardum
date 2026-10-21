@@ -1,9 +1,15 @@
 import React, { memo, useEffect, useRef, useState } from 'react';
 import { burnCountdownText } from '../burn';
-import { ScrollView, View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Platform, Image, Modal, ActivityIndicator } from 'react-native';
+import { ScrollView, View, Text, TextInput, TouchableOpacity, Pressable, FlatList, StyleSheet, Platform, Image, Modal, ActivityIndicator, Keyboard } from 'react-native';
 import { useKbPadding } from '../hooks/useKbPadding';
 import { Video, ResizeMode } from 'expo-av';
 import { Ionicons } from '@expo/vector-icons';
+import * as Clipboard from 'expo-clipboard';
+import { useThemedChooser } from './ThemedSheets';
+import { useThemedPrompt } from './ThemedPrompt';
+
+/** b199: media error marker for a file the relay no longer has (404). */
+export const MEDIA_GONE = 'gone';
 
 /** b140: above this size the pick preview shows a soft warning (send still allowed). */
 const MEDIA_SOFT_WARN_BYTES = 26214400; // 25 MB — matches chat.ts MEDIA_SOFT_WARN_BYTES
@@ -34,11 +40,20 @@ export interface ChatMessageUI {
   systemNote?: string;
   /** b72: epoch ms this message was first displayed here — burn-countdown anchor */
   openedAt?: number;
+  /** b199: group invitation card (Join / Decline) */
+  groupInvite?: { name: string; link: string; from?: string };
+  /** b199: reactions — one per side */
+  reactions?: { mine?: string; peer?: string };
 }
+
+/** b199 (owner request, Oct 17): the quick reactions on a held message */
+const REACTIONS = ['👍', '👎', '❤️', '🙏', '😂', '😮'];
 
 /** b62 groups: admin + roster context for group threads */
 export interface ChatGroupInfoUI {
   isCreator: boolean;
+  /** Batch F (R4-2-01): the forum — no key rotation; "Remove" blocks and removes posts */
+  forum?: boolean;
   epoch: number;
   fingerprint: string | null;
   members: { veilId: string; nick?: string; ikPub: string; role: string; joinedEpoch: number; tag: string }[];
@@ -72,6 +87,15 @@ export interface ChatScreenProps {
   draft: string;
   onDraftChange: (t: string) => void;
   onSend: () => void;
+  /** b199: hold a message to react (pairwise threads); omitted = off */
+  onReactMessage?: (id: string, emoji: string) => void;
+  /** Play UGC: long-press menu on someone else's group / forum message (each optional) */
+  onReportMessage?: (id: string, reason: string) => Promise<void>;
+  onBlockSender?: (id: string) => Promise<void>;
+  /** forum founder only: remove a post for everyone */
+  onRemoveMessage?: (id: string) => Promise<void>;
+  /** Play UGC: block this 1:1 contact (⋯ sheet; ends the chat) */
+  onBlockContact?: () => void;
   onBack: () => void;
   /** b144 W3: start an encrypted call on this thread (1:1, ready threads only) */
   onStartCall?: () => void;
@@ -85,6 +109,10 @@ export interface ChatScreenProps {
   onMediaRetry: (id: string) => void;
   onMediaSave: (id: string) => void;
   mediaSaving: Record<string, 'saving' | 'saved' | 'error'>;
+  /** b199 group invitations: joined/declined state kept on this phone */
+  inviteState?: Record<string, 'joined' | 'declined'>;
+  onJoinGroupInvite?: (msgId: string, link: string) => Promise<void>;
+  onDeclineGroupInvite?: (msgId: string) => Promise<void>;
   /** b62 voice notes */
   voiceRec: { active: boolean; seconds: number };
   onVoiceRecord: () => void;
@@ -185,24 +213,45 @@ interface MessageRowProps {
   onToggleAudio: (id: string, src: string, mime: string) => void;
   onOpenLightbox: (src: string, name: string) => void;
   onOpenVideo: (src: string, name: string) => void;
+  /** b199 group invite card state + actions */
+  inviteStatus?: 'joined' | 'declined' | 'joining' | 'error';
+  onJoinInvite?: (id: string, link: string) => void;
+  onDeclineInvite?: (id: string) => void;
+  /** b199 reactions: undefined = reactions off for this thread */
+  onReactOpen?: (id: string) => void;
+  reactOpen?: boolean;
+  onReact?: (id: string, emoji: string) => void;
+  /** Play UGC: long-press menu (report / block / remove); undefined = off */
+  onMenu?: (id: string) => void;
 }
 
 const MessageRow = memo(function MessageRow({
   item, group, burnAfterOpen, burnSeconds, threadKey,
   playing, avErrMsg, saveState,
   onMediaRetry, onMediaSave, onToggleAudio, onOpenLightbox, onOpenVideo,
+  inviteStatus, onJoinInvite, onDeclineInvite,
+  onReactOpen, reactOpen, onReact, onMenu,
 }: MessageRowProps) {
   const renderMedia = () => {
     const media = item.media!;
     if (media.loading && !media.src) {
       return (
         <View style={styles.mediaStub}>
-          <ActivityIndicator color="#5fd4c4" size="small" />
+          <ActivityIndicator color="#FFFFFF" size="small" />
           <Text style={styles.mediaStubTxt}>Decrypting media…</Text>
         </View>
       );
     }
     if (media.error && !media.src) {
+      // b199 (ZTE device run): the relay answered 404 — the file was deleted
+      // (burn window or expiry). Retrying can never bring it back.
+      if (media.error === MEDIA_GONE) {
+        return (
+          <View style={styles.mediaStub}>
+            <Text style={styles.mediaErrTxt}>Deleted — this media has burned</Text>
+          </View>
+        );
+      }
       return (
         <TouchableOpacity style={styles.mediaStub} onPress={() => onMediaRetry(item.id)}>
           <Text style={styles.mediaErrTxt}>Couldn't load media — tap to retry</Text>
@@ -286,9 +335,78 @@ const MessageRow = memo(function MessageRow({
     // web peers see the plain text too.
     return <Text style={styles.captureNotice}>{item.text}</Text>;
   }
+  if (item.groupInvite) {
+    // b199: group invitation sent privately inside this encrypted chat
+    const inv = item.groupInvite;
+    return (
+      <View style={[styles.bubbleRow, item.mine ? styles.mineRow : styles.peerRow]}>
+        <View style={styles.inviteCard}>
+          <Text style={styles.inviteKicker}>Group invitation</Text>
+          <Text style={styles.inviteName} numberOfLines={2}>{inv.name}</Text>
+          {item.mine ? (
+            <Text style={styles.inviteSub}>You invited them. Only their phone can take this seat. The link carries the group’s key, so keep it private.</Text>
+          ) : inviteStatus === 'joined' ? (
+            <Text style={styles.inviteDone}>✓ Joined — find it in Conversations</Text>
+          ) : inviteStatus === 'declined' ? (
+            <Text style={styles.inviteSub}>Declined</Text>
+          ) : (
+            <>
+              <Text style={styles.inviteSub}>You've been invited to join this group. This seat is for you.</Text>
+              {inviteStatus === 'error' ? <Text style={styles.inviteErr}>Couldn't join — the invite may have expired. Ask for a new one.</Text> : null}
+              <View style={styles.inviteActions}>
+                <TouchableOpacity style={styles.inviteJoin} onPress={() => onJoinInvite?.(item.id, inv.link)} disabled={inviteStatus === 'joining'}>
+                  <Text style={styles.inviteJoinTxt}>{inviteStatus === 'joining' ? 'Joining…' : 'Join'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.inviteDecline} onPress={() => onDeclineInvite?.(item.id)} disabled={inviteStatus === 'joining'}>
+                  <Text style={styles.inviteDeclineTxt}>Decline</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+          {item.ts ? (
+            <Text style={item.mine ? [styles.mineTs, styles.mineTsOnDark] : styles.peerTs}>
+              {new Date(item.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+            </Text>
+          ) : null}
+        </View>
+      </View>
+    );
+  }
+  const canReact = !!onReact && !item.systemNote && (!item.mine || !!item.id);
+  const reacts = [item.reactions?.peer, item.reactions?.mine].filter(Boolean) as string[];
   return (
     <View style={[styles.bubbleRow, item.mine ? styles.mineRow : styles.peerRow]}>
-      <View style={[styles.bubble, item.mine ? styles.mineBubble : styles.peerBubble, item.media ? styles.mediaBubble : null]}>
+      <View style={[styles.bubbleCol, item.mine ? styles.bubbleColMine : styles.bubbleColPeer]}>
+      {reactOpen && canReact ? (
+        <View style={[styles.reactBar, item.mine ? styles.reactBarMine : styles.reactBarPeer]}>
+          {REACTIONS.map((e) => (
+            <TouchableOpacity
+              key={e}
+              style={[styles.reactBtn, item.reactions?.mine === e ? styles.reactBtnOn : null]}
+              onPress={() => onReact?.(item.id, e)}
+              accessibilityLabel={item.reactions?.mine === e ? `Remove ${e} reaction` : `React ${e}`}
+            >
+              <Text style={styles.reactEmoji}>{e}</Text>
+            </TouchableOpacity>
+          ))}
+          {/* b54 (owner, device test Oct 18): copy a text message — needed to
+              pass invite links between phones from inside a chat */}
+          {!item.media && item.text ? (
+            <TouchableOpacity
+              style={styles.reactBtn}
+              onPress={() => { Clipboard.setStringAsync(item.text).catch(() => undefined); onReactOpen?.(item.id); }}
+              accessibilityLabel="Copy message text"
+            >
+              <Ionicons name="copy-outline" size={20} color="#FFFFFF" />
+            </TouchableOpacity>
+          ) : null}
+        </View>
+      ) : null}
+      <Pressable
+        onLongPress={canReact ? () => onReactOpen?.(item.id) : (onMenu && !item.mine && !item.systemNote ? () => onMenu(item.id) : undefined)}
+        delayLongPress={350}
+        style={[styles.bubble, styles.bubbleInCol, item.mine ? styles.mineBubble : styles.peerBubble, item.media ? styles.mediaBubble : null]}
+      >
         {group && !item.mine && item.sender ? (
           <Text style={styles.senderLbl}>
             {item.sender}{item.senderVerified ? ' ✓' : ''}
@@ -303,7 +421,7 @@ const MessageRow = memo(function MessageRow({
           <Text style={item.mine ? styles.mineText : styles.peerText}>{item.text}</Text>
         )}
         {item.ts ? (
-          <Text style={item.mine ? styles.mineTs : styles.peerTs}>
+          <Text style={item.mine ? [styles.mineTs, item.media ? styles.mineTsOnDark : null] : styles.peerTs}>
             {new Date(item.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
             {/* b123: read-receipt tick — teal ✓ read, replacing the washed-out
                 plain " · read" text (owner live-test ask, Sept 24). */}
@@ -314,6 +432,12 @@ const MessageRow = memo(function MessageRow({
             {burnAfterOpen && !item.systemNote && (!item.mine || item.read) ? <BurnCountdown openedAt={item.openedAt} burnSeconds={burnSeconds ?? 86400} /> : null}
           </Text>
         ) : null}
+      </Pressable>
+      {reacts.length ? (
+        <View style={[styles.reactBadge, item.mine ? styles.reactBadgeMine : styles.reactBadgePeer]}>
+          <Text style={styles.reactBadgeTxt}>{reacts.join(' ')}</Text>
+        </View>
+      ) : null}
       </View>
     </View>
   );
@@ -324,6 +448,9 @@ const MessageRow = memo(function MessageRow({
   if (ai.id !== bi.id || ai.text !== bi.text || ai.mine !== bi.mine || ai.ts !== bi.ts
     || ai.read !== bi.read || ai.sender !== bi.sender || ai.senderVerified !== bi.senderVerified
     || ai.systemNote !== bi.systemNote || ai.openedAt !== bi.openedAt) return false;
+  if ((ai.reactions?.mine ?? '') !== (bi.reactions?.mine ?? '') || (ai.reactions?.peer ?? '') !== (bi.reactions?.peer ?? '')
+    || a.reactOpen !== b.reactOpen || !!a.onReact !== !!b.onReact || !!a.onMenu !== !!b.onMenu) return false;
+  if ((ai.groupInvite?.link ?? '') !== (bi.groupInvite?.link ?? '') || a.inviteStatus !== b.inviteStatus) return false;
   const am = ai.media, bm = bi.media;
   if (!!am !== !!bm) return false;
   if (am && bm && (am.name !== bm.name || am.mime !== bm.mime || am.size !== bm.size
@@ -335,9 +462,80 @@ const MessageRow = memo(function MessageRow({
 });
 
 export function ChatScreen({ title, subtitle, status, busy, error, historyNotice, messages, threadKey, onDismissError, draft, onDraftChange, onSend, onBack, onStartCall, onEndSession, canNewThread, onNewThread, contact, myVerified, peerVerified, onVerifySession, onAttach, pendingPick, onSendMedia, onCancelPick, allowDl, onAllowDlChange, onMediaRetry, onMediaSave, mediaSaving, voiceRec, onVoiceRecord, onVoiceCancel, onVoiceSend, group, burnAfterOpen, burnSeconds, showVerifyCard, onVerifyCardDismiss, canRename, threadNickname, onRenameThread, sessionFingerprint, peerVeilId, peerPinned,
-  readOnly, textOnly, onPinContact }: ChatScreenProps) {
+  readOnly, textOnly, onPinContact, inviteState, onJoinGroupInvite, onDeclineGroupInvite, onReactMessage,
+  onReportMessage, onBlockSender, onRemoveMessage, onBlockContact }: ChatScreenProps) {
+  // Play UGC (18 Oct 2026): long-press someone else's group / forum message ->
+  // report it to the founder, block its sender, or (founder) remove it for
+  // everyone. Rows get one stable callback; the live props ride a ref.
+  const { node: chooserNode, choose } = useThemedChooser();
+  const { node: promptNode, ask } = useThemedPrompt();
+  const menuRef = useRef({ onReportMessage, onBlockSender, onRemoveMessage, messages });
+  menuRef.current = { onReportMessage, onBlockSender, onRemoveMessage, messages };
+  const hasMessageMenu = !!(onReportMessage || onBlockSender || onRemoveMessage);
+  const onMessageMenu = React.useCallback(async (id: string) => {
+    const { onReportMessage: report, onBlockSender: block, onRemoveMessage: remove, messages: list } = menuRef.current;
+    const item = list.find((m) => m.id === id);
+    if (!item || item.mine || item.systemNote) return;
+    const who = item.sender || 'this sender';
+    const actions: { label: string; sub?: string; run: () => Promise<void> }[] = [];
+    if (remove) actions.push({ label: 'Remove for everyone', sub: 'Deletes this post from the forum on every phone', run: async () => {
+      const ok = await ask({ title: 'Remove this post for everyone?', message: 'It disappears from the forum on every phone running a current Vardum. This can’t be undone.', confirm: true, danger: true, submitLabel: 'Remove' });
+      if (ok === true) await remove(id);
+    } });
+    if (report) actions.push({ label: 'Report post', sub: 'Only the founder can read it', run: async () => {
+      const reasons = ['Abuse or harassment', 'Hate or threats of violence', 'Sexual content', 'Spam or scam', 'Something else'];
+      const r = await choose({ title: 'Report this post', message: 'What you write and a copy of the post go only to the forum founder, end-to-end encrypted. The server and other forum members can see that you sent a report, but not what it says. The person you report isn’t notified.', options: reasons.map((label) => ({ label })) });
+      if (r === null) return;
+      let reason = reasons[r];
+      if (r === reasons.length - 1) {
+        const t = await ask({ title: 'What’s wrong with this post?', input: 'text', placeholder: 'A few words (optional)', maxLength: 300, submitLabel: 'Send report' });
+        if (t === null || t === false) return;
+        reason = String(t).trim() ? `Something else: ${String(t).trim()}` : 'Something else';
+      }
+      await report(id, reason);
+      await ask({ title: 'Report sent', message: 'Thank you. It goes to the founder’s phone and is opened in turn, so it may take a while. You can also block the sender from the same menu.', info: true });
+    } });
+    if (block) actions.push({ label: `Block ${who}`, sub: 'Hide their posts and messages on this phone', run: async () => {
+      const ok = await ask({ title: `Block ${who}?`, message: 'You won’t see their posts or messages on this phone, and they won’t notify you. They aren’t told. You can unblock them in Settings.', confirm: true, danger: true, submitLabel: 'Block' });
+      if (ok === true) await block(id);
+    } });
+    if (!actions.length) return;
+    const i = await choose({ title: 'This message', options: actions.map(({ label, sub }) => ({ label, sub })) });
+    if (i === null) return;
+    try {
+      await actions[i].run();
+    } catch (e) {
+      console.log('[veil-ugc] message action failed:', String((e as Error)?.message ?? e));
+      await ask({ title: 'That didn’t work', message: String((e as Error)?.message || 'Please try again in a moment.'), info: true });
+    }
+  }, [choose, ask]);
+  const confirmBlockContact = React.useCallback(async () => {
+    if (!onBlockContact) return;
+    const ok = await ask({ title: `Block ${title}?`, message: 'This ends the chat on both sides and hides them on this phone: no messages, no notifications, no new chat requests from them. They aren’t told why. You can unblock them in Settings.', confirm: true, danger: true, submitLabel: 'Block' });
+    if (ok === true) onBlockContact();
+  }, [ask, onBlockContact, title]);
+  // b199 reactions: which message's bar is open. Rows get stable callbacks
+  // (their memo compare skips callbacks), routed through a ref.
+  const [reactOpenId, setReactOpenId] = React.useState<string | null>(null);
+  const onReactRef = useRef(onReactMessage);
+  onReactRef.current = onReactMessage;
+  const openReact = React.useCallback((id: string) => setReactOpenId((cur) => (cur === id ? null : id)), []);
+  const pickReact = React.useCallback((id: string, emoji: string) => { setReactOpenId(null); onReactRef.current?.(id, emoji); }, []);
+  useEffect(() => { setReactOpenId(null); }, [threadKey]);
+  // b199 group invitations: in-flight / failed joins (persisted outcome lives in inviteState)
+  const [inviteBusy, setInviteBusy] = React.useState<Record<string, 'joining' | 'error'>>({});
+  const joinInvite = React.useCallback((id: string, link: string) => {
+    if (!onJoinGroupInvite) return;
+    setInviteBusy((s) => ({ ...s, [id]: 'joining' }));
+    onJoinGroupInvite(id, link)
+      .then(() => setInviteBusy((s) => { const n = { ...s }; delete n[id]; return n; }))
+      .catch((e) => { console.log('[veil-group-invite] join failed:', String((e as Error)?.message ?? e)); setInviteBusy((s) => ({ ...s, [id]: 'error' })); });
+  }, [onJoinGroupInvite]);
+  const declineInvite = React.useCallback((id: string) => { void onDeclineGroupInvite?.(id); }, [onDeclineGroupInvite]);
   // b62 groups: Members overlay + evict two-tap arming
   const [groupPanel, setGroupPanel] = React.useState(false);
+  // the members panel needs the whole screen — drop the message keyboard when it opens
+  React.useEffect(() => { if (groupPanel) Keyboard.dismiss(); }, [groupPanel]);
   const [evictArmed, setEvictArmed] = React.useState<string | null>(null);
   const [groupErr, setGroupErr] = React.useState<string | null>(null);
   React.useEffect(() => { if (!group) { setGroupPanel(false); setEvictArmed(null); setGroupErr(null); } }, [group]);
@@ -377,7 +575,16 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
   const audioWatchRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const stopAudio = async () => {
     if (audioWatchRef.current) { clearInterval(audioWatchRef.current); audioWatchRef.current = null; }
-    if (soundRef.current) { try { await soundRef.current.unloadAsync(); } catch { /* already gone */ } soundRef.current = null; }
+    const s = soundRef.current as ({ unloadAsync: () => Promise<unknown>; setOnPlaybackStatusUpdate?: (cb: null) => void } | null);
+    soundRef.current = null;
+    if (s) {
+      // b199 (seen on the first expo-av 15 device run: ~150 "ended" resets
+      // after one voice note): an unloaded player keeps emitting isLoaded:false
+      // status updates, and each one re-ran this stop. Detach the listener
+      // before unloading.
+      try { s.setOnPlaybackStatusUpdate?.(null); } catch { /* older player */ }
+      try { await s.unloadAsync(); } catch { /* already gone */ }
+    }
     setAudioPlayingId(null);
   };
   const [audioErr, setAudioErr] = useState<{ id: string; msg: string } | null>(null);
@@ -385,6 +592,7 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
     if (audioPlayingId === id) { await stopAudio(); return; }
     await stopAudio();
     setAudioErr(null);
+    console.log(`[veil-av] play tapped (${mime || 'no mime'}, ${src.slice(0, 5) === 'data:' ? 'data uri' : 'file'})`);
     try {
       // b73 (owner report: receive-side voice notes viewable but silently
       // dead on tap): a prior recording session on this device leaves iOS's
@@ -392,24 +600,48 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
       // best-effort, so a stale record-mode session can't mute playback.
       const { Audio } = require('expo-av');
       try { await Audio.setAudioModeAsync({ allowsRecordingIOS: false, playsInSilentModeIOS: true, staysActiveInBackground: false }); } catch { /* best-effort */ }
-      const { sound } = await Audio.Sound.createAsync(
+      // b199: this playback ends exactly once, however many status updates
+      // follow — and only once it has really started: expo-av 15 can report
+      // isLoaded:false BEFORE createAsync resolves, which used to end the
+      // playback before it began (row stuck on "Playing").
+      let ended = false;
+      let live: unknown = null;
+      const end = (why: string) => { if (ended || !live) return; ended = true; console.log(`[veil-av] ${why} — resetting row`); void stopAudio(); };
+      // b199 (Android device run): a player that never finishes loading used
+      // to leave the row silent with no log and no error. Give it 10 s.
+      const created = Audio.Sound.createAsync(
         { uri: src },
         { shouldPlay: true },
         (st: { isLoaded?: boolean; didJustFinish?: boolean; isPlaying?: boolean; positionMillis?: number }) => {
-          if (!st.isLoaded || st.didJustFinish) { console.log('[veil-av] status ended the playback — resetting row'); void stopAudio(); return; }
-          if (st.isPlaying === false && (st.positionMillis ?? 0) > 0) { console.log('[veil-av] status stopped-without-finish — resetting row'); void stopAudio(); }
+          if (ended || !live || soundRef.current !== live) return;
+          if (!st.isLoaded || st.didJustFinish) { end('status ended the playback'); return; }
+          if (st.isPlaying === false && (st.positionMillis ?? 0) > 0) end('status stopped-without-finish');
         },
       );
+      const { sound } = await Promise.race([
+        created,
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('player did not load within 10 s')), 10000)),
+      ]);
+      console.log('[veil-av] player loaded — playing');
       soundRef.current = sound as unknown as { unloadAsync: () => Promise<unknown> };
+      live = sound; // b199: from here on, status updates and the watchdog count
       setAudioPlayingId(id);
+      let ticks = 0;
       const watchdog = setInterval(async () => {
         try {
-          const s = await (sound as unknown as { getStatusAsync: () => Promise<{ isLoaded?: boolean; didJustFinish?: boolean; isPlaying?: boolean; positionMillis?: number }> }).getStatusAsync();
-          if (!s.isLoaded || s.didJustFinish || (s.isPlaying === false && (s.positionMillis ?? 0) > 0)) {
-            console.log(`[veil-av] watchdog: playback ended (loaded=${!!s.isLoaded} finish=${!!s.didJustFinish} playing=${!!s.isPlaying} pos=${s.positionMillis ?? 0}) — resetting row`);
-            void stopAudio();
+          const s = await (sound as unknown as { getStatusAsync: () => Promise<{ isLoaded?: boolean; didJustFinish?: boolean; isPlaying?: boolean; positionMillis?: number; durationMillis?: number; isBuffering?: boolean; volume?: number; isMuted?: boolean }> }).getStatusAsync();
+          if (ticks++ < 3) console.log(`[veil-av] tick ${ticks}: playing=${!!s.isPlaying} pos=${s.positionMillis ?? '?'} dur=${s.durationMillis ?? '?'} buffering=${!!s.isBuffering} vol=${s.volume ?? '?'} muted=${!!s.isMuted}`);
+          // b199 (ZTE device run): Android can load a note and never start it
+          // (shouldPlay ignored — the row sat on "Playing" at 0:00 in silence).
+          // Nudge it once at 2 s; if it still hasn't moved by 5 s, say so.
+          if (s.isLoaded && !s.isPlaying && (s.positionMillis ?? 0) === 0 && !s.isBuffering) {
+            if (ticks === 2) { console.log('[veil-av] not started — nudging play'); void (sound as unknown as { playAsync: () => Promise<unknown> }).playAsync().catch(() => undefined); }
+            if (ticks >= 5) { ended = true; console.log('[veil-av] never started — giving up'); void stopAudio(); setAudioErr({ id, msg: 'Could not play — tap to retry' }); }
           }
-        } catch { void stopAudio(); }
+          if (!s.isLoaded || s.didJustFinish || (s.isPlaying === false && (s.positionMillis ?? 0) > 0)) {
+            end(`watchdog: playback ended (loaded=${!!s.isLoaded} finish=${!!s.didJustFinish} playing=${!!s.isPlaying} pos=${s.positionMillis ?? 0})`);
+          }
+        } catch { end('watchdog: status read failed'); }
       }, 1000);
       audioWatchRef.current = watchdog;
     } catch (e) {
@@ -483,22 +715,24 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
     <View style={styles.fill}>
     <View style={styles.fill}>
       {/* header */}
+      {/* b199 UI redesign (owner, Oct 16): one clean bar — back, avatar, name +
+          status, call, ⋯. "＋ New" lived here AND in the ✕ sheet; it is now
+          only in the ⋯ sheet, and ⋯ replaces ✕ (✕ read as "close"). */}
       <View style={styles.header}>
-        <TouchableOpacity onPress={onBack} style={styles.backBtn}>
-          <Text style={styles.backTxt}>‹ Back</Text>
+        <TouchableOpacity onPress={onBack} style={styles.backBtn} hitSlop={{ top: 10, bottom: 10, left: 10, right: 6 }} accessibilityLabel="Back">
+          <Ionicons name="chevron-back" size={26} color="#FFFFFF" />
         </TouchableOpacity>
-        {onStartCall && status !== 'ended' && status !== 'pending' ? (
-          <TouchableOpacity onPress={onStartCall} style={styles.callBtn} hitSlop={{ top: 10, bottom: 10, left: 6, right: 6 }}>
-            {/* b198 (owner): a proper phone icon replaces the two-ring glyph */}
-            <Ionicons name="call-outline" size={22} color="#7cf4c8" />
-          </TouchableOpacity>
-        ) : null}
+        <View style={[styles.hAvatar, group && styles.hAvatarGroup]}>
+          <Text style={styles.hAvatarTxt}>{group ? '#' : title.slice(0, 2).toUpperCase()}</Text>
+        </View>
         <View style={styles.headerMid}>
           <Text style={styles.title} numberOfLines={1}>{title}</Text>
-          <Text style={styles.subtitle}>{status === 'pending' ? 'Waiting for your contact to accept…' : status === 'ended' ? 'Session ended' : subtitle}</Text>
+          {status === 'pending' || status === 'ended' ? (
+            <Text style={styles.subtitle} numberOfLines={1}>{status === 'pending' ? 'Waiting for your contact to accept…' : 'Session ended'}</Text>
+          ) : null}
           {group ? (
             <TouchableOpacity style={styles.vBadge} onPress={() => setGroupPanel(true)} hitSlop={{ top: 10, bottom: 10 }}>
-              <Text style={styles.vBadgeTxtHalf}>Epoch {group.epoch} · Members</Text>
+              <Text style={styles.vBadgeTxtGroup}>Members · epoch {group.epoch} ›</Text>
             </TouchableOpacity>
           ) : status !== 'ended' ? (
             /* b163 (web P1.2 parity): pinned contact threads show the SAME
@@ -516,20 +750,15 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
             </TouchableOpacity>
           ) : null}
         </View>
-        {status !== 'ended' && canNewThread ? (
-          <TouchableOpacity
-            onPress={() => { if (!busy) onNewThread(); }}
-            disabled={busy}
-            style={styles.newThreadBtn}
-            hitSlop={{ top: 8, bottom: 8, left: 4, right: 2 }}
-            accessibilityLabel="Start a new thread with the same person"
-          >
-            <Text style={styles.newThreadTxt}>＋ New</Text>
+        {onStartCall && status !== 'ended' && status !== 'pending' ? (
+          <TouchableOpacity onPress={onStartCall} style={styles.callBtn} hitSlop={{ top: 10, bottom: 10, left: 6, right: 6 }} accessibilityLabel="Call">
+            {/* b198 (owner): a proper phone icon replaces the two-ring glyph */}
+            <Ionicons name="call-outline" size={22} color="#FFFFFF" />
           </TouchableOpacity>
         ) : null}
         {status !== 'ended' ? (
-          <TouchableOpacity onPress={() => setSheet(true)} disabled={busy} style={styles.menuBtn} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
-            <Text style={styles.menuTxt}>✕</Text>
+          <TouchableOpacity onPress={() => setSheet(true)} disabled={busy} style={styles.menuBtn} hitSlop={{ top: 12, bottom: 12, left: 8, right: 12 }} accessibilityLabel="Chat options">
+            <Ionicons name="ellipsis-horizontal" size={22} color="#8E9696" />
           </TouchableOpacity>
         ) : null}
       </View>
@@ -556,7 +785,7 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
                   <View style={{ flex: 1 }}>
                     <Text style={styles.groupMemberName}>{m.nick ? m.nick : m.veilId.slice(0, 10) + '…'}</Text>
                     {!!m.nick && <Text style={styles.groupMemberMeta}>{m.veilId.slice(0, 10)}…</Text>}
-                    <Text style={styles.groupMemberMeta}>{m.role === 'creator' ? 'Creator' : 'Member'} · joined epoch {m.joinedEpoch}</Text>
+                    <Text style={styles.groupMemberMeta}>{m.role === 'creator' ? 'Creator' : m.role === 'pending' ? 'Waiting to be confirmed — no group keys yet' : 'Member'} · joined epoch {m.joinedEpoch}</Text>
                   </View>
                   {group.isCreator ? (
                     <TouchableOpacity
@@ -568,13 +797,13 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
                         try { await group.onEvict({ veilId: m.veilId, ikPub: m.ikPub }); } catch (e) { setGroupErr('That did not work — please try again.'); console.log('[veil-error] group-evict:', String((e as Error).message ?? e)); }
                       }}
                     >
-                      <Text style={styles.evictBtnTxt}>{evictArmed === m.veilId ? 'Remove?' : 'Remove'}</Text>
+                      <Text style={styles.evictBtnTxt}>{group.forum ? (evictArmed === m.veilId ? 'Block & remove posts?' : 'Block & remove posts') : (evictArmed === m.veilId ? 'Remove?' : 'Remove')}</Text>
                     </TouchableOpacity>
                   ) : null}
                 </View>
               ))}
             </ScrollView>
-            {group.isCreator ? (
+            {group.isCreator && !group.forum ? (
               <TouchableOpacity
                 style={styles.rotateBtn}
                 disabled={group.busy}
@@ -617,6 +846,10 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
         ref={listRef}
         style={styles.list}
         keyboardShouldPersistTaps="handled"
+        // b199: the keyboard goes down when the person scrolls the chat (or
+        // taps an empty part of it — "handled" above), not when they send
+        keyboardDismissMode="on-drag"
+        onScrollBeginDrag={() => setReactOpenId(null)}
         data={messages}
         keyExtractor={(m) => m.id}
         renderItem={({ item }) => (
@@ -634,6 +867,13 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
             onToggleAudio={toggleAudio}
             onOpenLightbox={(s, n) => setLightbox({ src: s, name: n })}
             onOpenVideo={(s, n) => { stopAudio(); setVideoFS({ src: s, name: n }); }}
+            inviteStatus={inviteState?.[item.id] ?? inviteBusy[item.id]}
+            onJoinInvite={joinInvite}
+            onDeclineInvite={declineInvite}
+            onReactOpen={onReactMessage ? openReact : undefined}
+            reactOpen={reactOpenId === item.id}
+            onReact={onReactMessage ? pickReact : undefined}
+            onMenu={hasMessageMenu ? onMessageMenu : undefined}
           />
         )}
         ListEmptyComponent={
@@ -662,48 +902,66 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
         {loungeNote ? (
           <Text style={styles.loungeNoteTxt}>{loungeNote}</Text>
         ) : null}
-        <TextInput
-          style={[styles.input, composerLocked && styles.inputLocked]}
-          placeholder={readOnly ? 'Read-only founder broadcast' : status === 'pending' ? 'Locked until your contact accepts' : verifyGate ? 'Locked until you both verify' : 'Message…'}
-          placeholderTextColor="#3a4750"
-          value={draft}
-          onChangeText={onDraftChange}
-          editable={!composerLocked}
-          multiline
-        />
-        <TouchableOpacity
-          style={[styles.attachBtn, textOnly ? styles.attachBtnOff : (composerLocked ? styles.attachBtnOff : styles.attachBtnOn)]}
-          disabled={composerLocked || !!textOnly}
-          onPress={onAttach}
-        >
-          <Text style={[styles.attachTxt, composerLocked && styles.attachTxtOff]}>＋</Text>
-        </TouchableOpacity>
-        {/* b62 voice notes: mic in the composer; recording UI replaces the bar */}
+        {/* b199 UI redesign (owner, Oct 16): attach · message · mic/send. The
+            mic becomes a send arrow as soon as there is text; while recording,
+            the bar becomes cancel · timer · send. */}
         {voiceRec.active ? (
-          <TouchableOpacity style={styles.micBtnRec} onPress={onVoiceSend}>
-            <Text style={styles.micBtnTxt}>● {fmtSecs(voiceRec.seconds)} — send</Text>
-          </TouchableOpacity>
+          <>
+            <TouchableOpacity style={[styles.roundBtn, styles.roundBtnGhost]} onPress={onVoiceCancel} accessibilityLabel="Cancel voice note">
+              <Ionicons name="close" size={20} color="#8E9696" />
+            </TouchableOpacity>
+            <View style={styles.recBar}>
+              <View style={styles.recDot} />
+              <Text style={styles.recTxt}>Recording {fmtSecs(voiceRec.seconds)}</Text>
+            </View>
+            <TouchableOpacity style={[styles.roundBtn, styles.roundBtnSend]} onPress={onVoiceSend} accessibilityLabel="Send voice note">
+              <Ionicons name="arrow-up" size={20} color="#0B0B0F" />
+            </TouchableOpacity>
+          </>
         ) : (
-          <TouchableOpacity
-            style={[styles.attachBtn, textOnly ? styles.attachBtnOff : (composerLocked ? styles.attachBtnOff : styles.attachBtnOn)]}
-            disabled={composerLocked || !!textOnly}
-            onPress={onVoiceRecord}
-          >
-            <Text style={[styles.attachTxt, composerLocked && styles.attachTxtOff]}>🎤</Text>
-          </TouchableOpacity>
-        )}
-        {voiceRec.active ? (
-          <TouchableOpacity style={[styles.sendBtn, styles.sendBtnOff]} onPress={onVoiceCancel}>
-            <Text style={styles.sendTxt}>✕</Text>
-          </TouchableOpacity>
-        ) : (
-          <TouchableOpacity
-            style={[styles.sendBtn, (!composerLocked && draft.trim()) ? styles.sendBtnOn : styles.sendBtnOff]}
-            disabled={composerLocked || !draft.trim()}
-            onPress={onSend}
-          >
-            <Text style={[styles.sendTxt, (!composerLocked && draft.trim()) && styles.sendTxtOn]}>Send</Text>
-          </TouchableOpacity>
+          <>
+            <TouchableOpacity
+              style={[styles.roundBtn, styles.roundBtnGhost, (composerLocked || textOnly) && styles.roundBtnOff]}
+              disabled={composerLocked || !!textOnly}
+              onPress={onAttach}
+              accessibilityLabel="Attach a photo or video"
+            >
+              <Ionicons name="add" size={24} color="#FFFFFF" />
+            </TouchableOpacity>
+            <TextInput
+              style={[styles.input, composerLocked && styles.inputLocked]}
+              placeholder={readOnly ? 'Read-only founder broadcast' : status === 'pending' ? 'Locked until your contact accepts' : verifyGate ? 'Locked until you both verify' : 'Message'}
+              placeholderTextColor="#5E6464"
+              value={draft}
+              onChangeText={onDraftChange}
+              // b199 (owner request): the keyboard stays up after Send. The box
+              // used to go non-editable while a send was in flight (busy), and
+              // iOS drops the keyboard when the focused input is disabled.
+              // Busy still blocks a second send via the button.
+              editable={!readOnly && status === 'active' && !verifyGate}
+              multiline
+            />
+            {draft.trim() || textOnly ? (
+              <TouchableOpacity
+                style={[styles.roundBtn, (!composerLocked && draft.trim()) ? styles.roundBtnSend : [styles.roundBtnGhost, styles.roundBtnOff]]}
+                disabled={composerLocked || !draft.trim()}
+                onPress={onSend}
+                accessibilityLabel="Send"
+              >
+                <Ionicons name="arrow-up" size={20} color={(!composerLocked && draft.trim()) ? '#0B0B0F' : '#8E9696'} />
+              </TouchableOpacity>
+            ) : (
+              /* b62 voice notes: mic in the composer; recording UI replaces the bar */
+              <TouchableOpacity
+                style={[styles.roundBtn, styles.roundBtnGhost, composerLocked && styles.roundBtnOff]}
+                disabled={composerLocked}
+                onPress={onVoiceRecord}
+                accessibilityLabel="Record a voice note"
+              >
+                <Ionicons name="mic-outline" size={21} color="#FFFFFF" />
+              </TouchableOpacity>
+            )}
+          </>
         )}
       </View>
     </View>
@@ -740,7 +998,7 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
                   <Text style={styles.pickAudioMeta}>{pendingPick.name || 'video'}</Text>
                 </View>
                 <Text style={styles.pickMeta}>{(pendingPick.size / 1048576).toFixed(1)} MB · encrypted on this phone before it is uploaded</Text>
-                {pendingPick.size > MEDIA_SOFT_WARN_BYTES ? <Text style={styles.pickWarn}>Large file — encrypting and sending may take a few minutes. Keep VEIL open until it sends.</Text> : null}
+                {pendingPick.size > MEDIA_SOFT_WARN_BYTES ? <Text style={styles.pickWarn}>Large file — encrypting and sending may take a few minutes. Keep Vardum open until it sends.</Text> : null}
               </>
             ) : (
               <>
@@ -748,7 +1006,7 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
                 <Image source={{ uri: pendingPick.uri }} style={styles.pickPreview} resizeMode="contain" />
                 <Text style={styles.pickMeta}>{pendingPick.name || 'media'}</Text>
                 <Text style={styles.pickMeta}>{(pendingPick.size / 1048576).toFixed(1)} MB · encrypted on this phone before it is uploaded</Text>
-                {pendingPick.size > MEDIA_SOFT_WARN_BYTES ? <Text style={styles.pickWarn}>Large file — encrypting and sending may take a few minutes. Keep VEIL open until it sends.</Text> : null}
+                {pendingPick.size > MEDIA_SOFT_WARN_BYTES ? <Text style={styles.pickWarn}>Large file — encrypting and sending may take a few minutes. Keep Vardum open until it sends.</Text> : null}
               </>
             )}
             <TouchableOpacity style={styles.dlToggle} onPress={() => onAllowDlChange(!allowDl)} activeOpacity={0.7}>
@@ -786,6 +1044,12 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
                 <Text style={styles.sheetRowSub}>All-new keys — no new invitation needed</Text>
               </TouchableOpacity>
             ) : null}
+            {onBlockContact ? (
+              <TouchableOpacity style={styles.sheetRowDanger} onPress={() => { setSheet(false); void confirmBlockContact(); }}>
+                <Text style={styles.sheetRowDangerTxt}>Block this contact</Text>
+                <Text style={styles.sheetRowDangerSub}>Ends this chat and hides them on this phone</Text>
+              </TouchableOpacity>
+            ) : null}
             <TouchableOpacity style={styles.sheetRowDanger} onPress={() => { setSheet(false); onEndSession(); }}>
               {group ? (
                 <>
@@ -807,7 +1071,7 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
       </Modal>
       {/* b126 verification panel — fingerprint viewable pre AND post verification;
           "Mark verified" only unlocks after an explicit out-of-band comparison
-          confirmation. VEIL-themed per standing rule (#101920 card, #7cf4c8 accent). */}
+          confirmation. Vardum palette (#15151B card, white primary). */}
       <Modal visible={!!verifyPanel} transparent animationType="fade" onRequestClose={() => setVerifyPanel(null)}>
         <TouchableOpacity style={styles.rnBackdrop} activeOpacity={1} onPress={() => setVerifyPanel(null)}>
           <TouchableOpacity style={styles.rnCard} activeOpacity={1} onPress={() => undefined}>
@@ -815,13 +1079,13 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
               <>
                 <Text style={styles.rnTitle}>Verify this session</Text>
                 <Text style={styles.fpBox} selectable>
-                  {sessionFingerprint ?? '(fingerprint unavailable on this device — compare the fingerprint shown on your peer\'s screen)'}
+                  {sessionFingerprint ?? 'No safety code yet. It appears here once the other phone has opened Vardum and joined this chat. Keep Vardum open on both phones and wait a few seconds; starting another new chat resets this.'}
                 </Text>
                 <Text style={styles.rnBody}>Compare it with your peer out-of-band — read it to them on a call, or side by side in person. Only continue if every group of characters matches exactly.</Text>
                 <TouchableOpacity
                   style={[styles.fpStepBtn, compareArmed && styles.fpStepBtnOn]}
                   onPress={() => setCompareArmed(true)}
-                  disabled={compareArmed}
+                  disabled={compareArmed || !sessionFingerprint} // Batch G (NF-1)
                 >
                   <Text style={[styles.fpStepBtnTxt, compareArmed && styles.fpStepBtnTxtOn]}>
                     {compareArmed ? '✓ Compared — they match' : 'I compared them — they match'}
@@ -835,8 +1099,8 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
                     <Text style={styles.rnBtnGhostTxt}>Cancel</Text>
                   </TouchableOpacity>
                   <TouchableOpacity
-                    style={[styles.rnBtnTeal, !compareArmed && styles.fpBtnDisabled]}
-                    disabled={!compareArmed}
+                    style={[styles.rnBtnTeal, (!compareArmed || !sessionFingerprint) && styles.fpBtnDisabled]}
+                    disabled={!compareArmed || !sessionFingerprint}
                     onPress={() => {
                       setVerifyFail(false);
                       void onVerifySession().then((ok) => { if (!ok) setVerifyFail(true); else setVerifyPanel(null); });
@@ -883,7 +1147,7 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
             <TextInput
               style={styles.rnInput}
               placeholder="e.g. Founder Tester Lounge"
-              placeholderTextColor="#3b4b56"
+              placeholderTextColor="#5E6464"
               value={renameInput}
               onChangeText={setRenameInput}
               maxLength={40}
@@ -926,185 +1190,228 @@ export function ChatScreen({ title, subtitle, status, busy, error, historyNotice
           <Text style={styles.lightboxHint}>{lightbox?.name ?? ''} — tap anywhere to close</Text>
         </TouchableOpacity>
       </Modal>
+      {chooserNode}
+      {promptNode}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   fpFailTxt: { color: '#e8896b', fontSize: 13, lineHeight: 18, marginBottom: 10 },
-  fill: { flex: 1, backgroundColor: '#0b0f14' },
-  header: { flexDirection: 'row', alignItems: 'center', padding: 14, borderBottomWidth: 1, borderBottomColor: '#141d25', paddingTop: 44 },
-  backBtn: { padding: 6 },
-  callBtn: { paddingVertical: 4, paddingHorizontal: 8, marginLeft: 4 },
-  callGlyph: { color: '#7cf4c8', fontSize: 20, lineHeight: 24 },
+  fill: { flex: 1, backgroundColor: '#0B0B0F' },
+  header: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 8, paddingBottom: 10, paddingTop: 48, borderBottomWidth: 1, borderBottomColor: '#24242D', backgroundColor: '#0B0B0F' },
+  backBtn: { paddingVertical: 4, paddingRight: 2 },
+  hAvatar: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#24242D', alignItems: 'center', justifyContent: 'center', marginLeft: 2 },
+  hAvatarGroup: { borderRadius: 11, backgroundColor: '#24242D' },
+  hAvatarTxt: { color: '#FFFFFF', fontSize: 13, fontWeight: '700' },
+  callBtn: { paddingVertical: 6, paddingHorizontal: 8 },
+  callGlyph: { color: '#FFFFFF', fontSize: 20, lineHeight: 24 },
   // b62 groups
-  senderLbl: { color: '#5fd4c4', fontSize: 11, marginBottom: 2 },
-  groupOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(3,7,12,0.86)', justifyContent: 'center', padding: 18, zIndex: 40 },
-  groupPanel: { backgroundColor: '#0B1018', borderColor: '#1d2a38', borderWidth: 1, borderRadius: 14, padding: 16, maxHeight: '72%' },
+  senderLbl: { color: '#FFFFFF', fontSize: 11, marginBottom: 2 },
+  groupOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(11,11,15,0.86)', justifyContent: 'center', padding: 18, zIndex: 40 },
+  groupPanel: { backgroundColor: '#0B0B0F', borderColor: '#24242D', borderWidth: 1, borderRadius: 14, padding: 16, maxHeight: '72%' },
   groupPanelHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 },
-  groupPanelTitle: { color: '#EAF2F6', fontSize: 16, fontWeight: '700' },
-  groupCloseTxt: { color: '#7c8a96', fontSize: 18, paddingHorizontal: 6 },
+  groupPanelTitle: { color: '#FFFFFF', fontSize: 16, fontWeight: '700' },
+  groupCloseTxt: { color: '#8E9696', fontSize: 18, paddingHorizontal: 6 },
   groupFp: { color: '#8a6d3b', fontSize: 11, marginBottom: 10 },
   groupMemberList: { flexGrow: 0 },
-  groupEmpty: { color: '#7c8a96', fontSize: 13, paddingVertical: 8 },
-  groupMemberRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#16202c' },
-  groupMemberName: { color: '#EAF2F6', fontSize: 13 },
-  groupMemberMeta: { color: '#7c8a96', fontSize: 11, marginTop: 1 },
+  groupEmpty: { color: '#8E9696', fontSize: 13, paddingVertical: 8 },
+  groupMemberRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 8, borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: '#24242D' },
+  groupMemberName: { color: '#FFFFFF', fontSize: 13 },
+  groupMemberMeta: { color: '#8E9696', fontSize: 11, marginTop: 1 },
   evictBtn: { borderColor: '#7c3a3a', borderWidth: 1, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 5 },
   evictBtnArmed: { backgroundColor: '#7c3a3a' },
   evictBtnTxt: { color: '#f0b8b8', fontSize: 11 },
-  rotateBtn: { backgroundColor: '#12323a', borderColor: '#2c5a57', borderWidth: 1, borderRadius: 10, paddingVertical: 10, alignItems: 'center', marginTop: 12 },
-  rotateBtnTxt: { color: '#7cf4c8', fontSize: 13, fontWeight: '600' },
+  rotateBtn: { backgroundColor: '#24242D', borderColor: '#3A3A44', borderWidth: 1, borderRadius: 10, paddingVertical: 10, alignItems: 'center', marginTop: 12 },
+  rotateBtnTxt: { color: '#FFFFFF', fontSize: 13, fontWeight: '600' },
   groupErr: { color: '#f0b8b8', fontSize: 12, marginTop: 8 },
-  backTxt: { color: '#7cf4c8', fontSize: 14 },
-  headerMid: { flex: 1, marginHorizontal: 8 },
-  title: { color: '#d7e2e8', fontSize: 15, fontWeight: '600' },
-  subtitle: { color: '#41505b', fontSize: 11, marginTop: 2 },
-  vBadge: { alignSelf: 'flex-start', marginTop: 6, borderWidth: 1, borderRadius: 999, paddingHorizontal: 8, paddingVertical: 2 },
-  vBadgeOk: { borderColor: '#2e6b4f', backgroundColor: 'rgba(63,185,127,0.10)' },
-  vBadgeHalf: { borderColor: '#6b5a2e', backgroundColor: 'rgba(245,194,107,0.10)' },
-  vBadgeNone: { borderColor: '#2a3a48', backgroundColor: 'transparent' },
+  backTxt: { color: '#FFFFFF', fontSize: 14 },
+  headerMid: { flex: 1, minWidth: 0, marginHorizontal: 10 },
+  title: { color: '#FFFFFF', fontSize: 16, fontWeight: '700' },
+  subtitle: { color: '#8E9696', fontSize: 12, marginTop: 2 },
+  vBadge: { alignSelf: 'flex-start', marginTop: 3, borderWidth: 1, borderColor: 'transparent', borderRadius: 999, paddingHorizontal: 7, paddingVertical: 1 },
+  vBadgeTxtGroup: { color: '#FFFFFF', fontSize: 12, fontWeight: '600' },
+  vBadgeOk: { borderColor: '#3A3A44', backgroundColor: 'rgba(255,255,255,0.10)' },
+  vBadgeHalf: { borderColor: '#5c4526', backgroundColor: 'rgba(214,154,92,0.10)' },
+  vBadgeNone: { borderColor: '#3A3A44', backgroundColor: 'transparent' },
   vBadgeTxt: { fontSize: 11, fontWeight: '600' },
-  vBadgeTxtOk: { color: '#3fb97f' },
-  vBadgeTxtHalf: { color: '#f5c26b' },
-  vBadgeTxtNone: { color: '#8aa0b2' },
-  newThreadBtn: { borderWidth: 1, borderColor: '#27435a', borderRadius: 8, paddingHorizontal: 10, height: 34, minWidth: 56, alignItems: 'center', justifyContent: 'center' },
-  newThreadTxt: { color: '#7fd4ff', fontSize: 13, fontWeight: '600' },
-  menuBtn: { paddingHorizontal: 10, paddingVertical: 6 },
-  menuTxt: { color: '#7a8b96', fontSize: 22, fontWeight: '700' },
+  vBadgeTxtOk: { color: '#20D9C2' }, // b199 (owner, Oct 17): the logo's teal "V"
+  vBadgeTxtHalf: { color: '#d69a5c' },
+  vBadgeTxtNone: { color: '#8E9696' },
+  newThreadBtn: { borderWidth: 1, borderColor: '#3A3A44', borderRadius: 8, paddingHorizontal: 10, height: 34, minWidth: 56, alignItems: 'center', justifyContent: 'center' },
+  newThreadTxt: { color: '#FFFFFF', fontSize: 13, fontWeight: '600' },
+  menuBtn: { paddingHorizontal: 8, paddingVertical: 6 },
+  menuTxt: { color: '#8E9696', fontSize: 22, fontWeight: '700' },
   // (b66) ✕ sheet
-  sheetBackdrop: { flex: 1, backgroundColor: 'rgba(3,7,11,0.8)', justifyContent: 'flex-end' },
-  sheetPanel: { backgroundColor: '#101920', borderTopLeftRadius: 18, borderTopRightRadius: 18, borderWidth: 1, borderColor: '#22323d', paddingHorizontal: 14, paddingBottom: 34, paddingTop: 6 },
-  sheetRow: { paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: '#1a2530' },
-  sheetRowTxt: { color: '#d5e3dd', fontSize: 15, fontWeight: '700', textAlign: 'center' },
-  sheetRowSub: { color: '#5a6b76', fontSize: 12, marginTop: 3, textAlign: 'center' },
-  sheetRowDanger: { paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: '#1a2530' },
+  sheetBackdrop: { flex: 1, backgroundColor: 'rgba(11,11,15,0.8)', justifyContent: 'flex-end' },
+  sheetPanel: { backgroundColor: '#15151B', borderTopLeftRadius: 18, borderTopRightRadius: 18, borderWidth: 1, borderColor: '#24242D', paddingHorizontal: 14, paddingBottom: 34, paddingTop: 6 },
+  sheetRow: { paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: '#24242D' },
+  sheetRowTxt: { color: '#FFFFFF', fontSize: 15, fontWeight: '700', textAlign: 'center' },
+  sheetRowSub: { color: '#8E9696', fontSize: 12, marginTop: 3, textAlign: 'center' },
+  sheetRowDanger: { paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: '#24242D' },
   sheetRowDangerTxt: { color: '#ff5a4e', fontSize: 15, fontWeight: '800', textAlign: 'center' },
   sheetRowDangerSub: { color: '#8a5450', fontSize: 12, marginTop: 3, textAlign: 'center' },
   sheetRowCancel: { paddingVertical: 16 },
-  // b123: teal read-receipt tick appended to my read bubbles' timestamps
-  readTick: { color: '#7cf4c8', fontWeight: '700' },
-  // b123: rename-thread modal (VEIL palette: #101920 card, #7cf4c8 accent)
-  rnBackdrop: { flex: 1, backgroundColor: 'rgba(3,7,11,0.8)', justifyContent: 'center', alignItems: 'center', padding: 28 },
-  rnCard: { width: '100%', backgroundColor: '#101920', borderRadius: 16, borderWidth: 1, borderColor: '#22323d', padding: 18 },
-  rnTitle: { color: '#e6f1ed', fontSize: 17, fontWeight: '800', textAlign: 'center' },
-  rnBody: { color: '#5a6b76', fontSize: 12, textAlign: 'center', marginTop: 6, marginBottom: 14 },
-  rnInput: { backgroundColor: '#0c141c', borderWidth: 1, borderColor: '#1f4a42', borderRadius: 10, color: '#d5e3dd', paddingHorizontal: 12, paddingVertical: 10, fontSize: 15 },
+  // b123: read-receipt tick appended to my read bubbles' timestamps
+  // Vardum: inherits the timestamp colour so it reads on the white sent bubble and on dark media bubbles
+  readTick: { fontWeight: '700' },
+  // b123: rename-thread modal (Vardum palette: #15151B card, white primary)
+  rnBackdrop: { flex: 1, backgroundColor: 'rgba(11,11,15,0.8)', justifyContent: 'center', alignItems: 'center', padding: 28 },
+  rnCard: { width: '100%', backgroundColor: '#15151B', borderRadius: 16, borderWidth: 1, borderColor: '#24242D', padding: 18 },
+  rnTitle: { color: '#FFFFFF', fontSize: 17, fontWeight: '800', textAlign: 'center' },
+  rnBody: { color: '#8E9696', fontSize: 12, textAlign: 'center', marginTop: 6, marginBottom: 14 },
+  rnInput: { backgroundColor: '#15151B', borderWidth: 1, borderColor: '#3A3A44', borderRadius: 10, color: '#FFFFFF', paddingHorizontal: 12, paddingVertical: 10, fontSize: 15 },
   rnActions: { flexDirection: 'row', marginTop: 14 },
-  rnBtnGhost: { flex: 1, alignItems: 'center', paddingVertical: 12, borderRadius: 10, borderWidth: 1, borderColor: '#22323d', marginRight: 8 },
-  rnBtnGhostTxt: { color: '#8fa5b0', fontSize: 14, fontWeight: '700' },
-  rnBtnTeal: { flex: 1, alignItems: 'center', paddingVertical: 12, borderRadius: 10, backgroundColor: '#7cf4c8' },
-  rnBtnTealTxt: { color: '#0c141c', fontSize: 14, fontWeight: '800' },
-  sheetCancelTxt: { color: '#7a8b96', fontSize: 15, fontWeight: '700', textAlign: 'center' },
+  rnBtnGhost: { flex: 1, alignItems: 'center', paddingVertical: 12, borderRadius: 10, borderWidth: 1, borderColor: '#24242D', marginRight: 8 },
+  rnBtnGhostTxt: { color: '#8E9696', fontSize: 14, fontWeight: '700' },
+  rnBtnTeal: { flex: 1, alignItems: 'center', paddingVertical: 12, borderRadius: 10, backgroundColor: '#FFFFFF' },
+  rnBtnTealTxt: { color: '#0B0B0F', fontSize: 14, fontWeight: '800' },
+  sheetCancelTxt: { color: '#8E9696', fontSize: 15, fontWeight: '700', textAlign: 'center' },
   endBtn: { padding: 6 },
   endTxt: { color: '#8a4b55', fontSize: 13 },
   error: { color: '#d98b8b', fontSize: 12, paddingHorizontal: 16, paddingTop: 8 },
   notice: { color: '#e0a458', fontSize: 12, paddingHorizontal: 16, paddingTop: 4 },
   list: { flex: 1, paddingHorizontal: 12 },
   bubbleRow: { flexDirection: 'row', marginVertical: 3 },
+  // b199 reactions: bar above, bubble, badge below, all on the bubble's side
+  bubbleCol: { maxWidth: '78%' },
+  bubbleColMine: { alignItems: 'flex-end' },
+  bubbleColPeer: { alignItems: 'flex-start' },
+  bubbleInCol: { maxWidth: '100%' },
+  reactBar: { flexDirection: 'row', backgroundColor: '#15151B', borderWidth: 1, borderColor: '#24242D', borderRadius: 22, paddingHorizontal: 4, paddingVertical: 3, marginBottom: 4 },
+  reactBarMine: { alignSelf: 'flex-end' },
+  reactBarPeer: { alignSelf: 'flex-start' },
+  reactBtn: { width: 38, height: 38, borderRadius: 19, alignItems: 'center', justifyContent: 'center' },
+  reactBtnOn: { backgroundColor: '#3A3A44' },
+  reactEmoji: { fontSize: 22 },
+  reactBadge: { marginTop: -6, backgroundColor: '#15151B', borderWidth: 1, borderColor: '#24242D', borderRadius: 12, paddingHorizontal: 6, paddingVertical: 1 },
+  reactBadgeMine: { marginRight: 6 },
+  reactBadgePeer: { marginLeft: 6 },
+  reactBadgeTxt: { fontSize: 14 },
   mineRow: { justifyContent: 'flex-end' },
   peerRow: { justifyContent: 'flex-start' },
+  // b199 group invitation card
+  inviteCard: { maxWidth: '86%', borderWidth: 1, borderColor: '#3A3A44', backgroundColor: '#15151B', borderRadius: 14, padding: 14 },
+  inviteKicker: { color: '#FFFFFF', fontSize: 10, fontWeight: '800', letterSpacing: 0.8, textTransform: 'uppercase' },
+  inviteName: { color: '#FFFFFF', fontSize: 17, fontWeight: '700', marginTop: 4 },
+  inviteSub: { color: '#8E9696', fontSize: 12, lineHeight: 17, marginTop: 6 },
+  inviteDone: { color: '#FFFFFF', fontSize: 13, fontWeight: '600', marginTop: 8 },
+  inviteErr: { color: '#e8836f', fontSize: 12, marginTop: 6 },
+  inviteActions: { flexDirection: 'row', gap: 8, marginTop: 12 },
+  inviteJoin: { backgroundColor: '#FFFFFF', borderRadius: 10, paddingVertical: 9, paddingHorizontal: 22 },
+  inviteJoinTxt: { color: '#0B0B0F', fontWeight: '800', fontSize: 14 },
+  inviteDecline: { borderWidth: 1, borderColor: '#24242D', borderRadius: 10, paddingVertical: 9, paddingHorizontal: 16 },
+  inviteDeclineTxt: { color: '#8E9696', fontWeight: '600', fontSize: 14 },
   bubble: { maxWidth: '78%', borderRadius: 16, paddingHorizontal: 12, paddingVertical: 8 },
-  mediaBubble: { padding: 6 },
-  mineBubble: { backgroundColor: '#12514a' },
-  peerBubble: { backgroundColor: '#131c24' },
-  mineText: { color: '#eafff7', fontSize: 14 },
-  peerText: { color: '#d7e2e8', fontSize: 14 },
-  mineTs: { color: '#6fa79e', fontSize: 9, marginTop: 3, textAlign: 'right' },
-  peerTs: { color: '#3a4750', fontSize: 9, marginTop: 3 },
-  mediaImg: { width: 220, height: 220, borderRadius: 12, backgroundColor: '#0e151c' },
-  mediaStub: { width: 220, height: 120, borderRadius: 12, backgroundColor: '#0e151c', alignItems: 'center', justifyContent: 'center' },
-  mediaStubTxt: { color: '#5a6b76', fontSize: 12, marginTop: 8 },
+  // Vardum: media bubbles stay dark (white sent bubble would hide the white audio/play controls)
+  mediaBubble: { padding: 6, backgroundColor: '#24242D' },
+  mineBubble: { backgroundColor: '#FFFFFF' },
+  peerBubble: { backgroundColor: '#15151B' },
+  mineText: { color: '#0B0B0F', fontSize: 14 },
+  peerText: { color: '#FFFFFF', fontSize: 14 },
+  mineTs: { color: '#5E6464', fontSize: 9, marginTop: 3, textAlign: 'right' },
+  mineTsOnDark: { color: '#8E9696' },
+  peerTs: { color: '#5E6464', fontSize: 9, marginTop: 3 },
+  mediaImg: { width: 220, height: 220, borderRadius: 12, backgroundColor: '#0B0B0F' },
+  mediaStub: { width: 220, height: 120, borderRadius: 12, backgroundColor: '#0B0B0F', alignItems: 'center', justifyContent: 'center' },
+  mediaStubTxt: { color: '#5E6464', fontSize: 12, marginTop: 8 },
   mediaErrTxt: { color: '#d98b8b', fontSize: 12 },
-  mediaCaption: { color: '#7d919e', fontSize: 10, marginTop: 4, maxWidth: 220 },
+  mediaCaption: { color: '#8E9696', fontSize: 10, marginTop: 4, maxWidth: 220 },
   micBtnRec: { backgroundColor: 'rgba(214,160,84,0.15)', borderWidth: 1, borderColor: '#8a6d3b', borderRadius: 8, paddingHorizontal: 10, paddingVertical: 9, marginLeft: 4 },
   micBtnTxt: { color: '#d6a054', fontSize: 12, fontWeight: '600' },
   audioRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 2 },
-  audioBtn: { width: 34, height: 34, borderRadius: 17, backgroundColor: 'rgba(127,244,200,0.12)', borderWidth: 1, borderColor: '#2e6b4f', alignItems: 'center', justifyContent: 'center' },
-  audioBtnTxt: { color: '#7cf4c8', fontSize: 14 },
-  audioLbl: { color: '#aebfc9', fontSize: 12, marginLeft: 8 },
-  videoBox: { width: 220, height: 120, borderRadius: 8, backgroundColor: '#101820', borderWidth: 1, borderColor: '#1d2b36', alignItems: 'center', justifyContent: 'center' },
-  videoIcon: { color: '#7cf4c8', fontSize: 22 },
-  videoLbl: { color: '#7d919e', fontSize: 10, marginTop: 4 },
+  audioBtn: { width: 34, height: 34, borderRadius: 17, backgroundColor: 'rgba(255,255,255,0.12)', borderWidth: 1, borderColor: '#3A3A44', alignItems: 'center', justifyContent: 'center' },
+  audioBtnTxt: { color: '#FFFFFF', fontSize: 14 },
+  audioLbl: { color: '#C9CFCE', fontSize: 12, marginLeft: 8 },
+  videoBox: { width: 220, height: 120, borderRadius: 8, backgroundColor: '#15151B', borderWidth: 1, borderColor: '#24242D', alignItems: 'center', justifyContent: 'center' },
+  videoIcon: { color: '#FFFFFF', fontSize: 22 },
+  videoLbl: { color: '#8E9696', fontSize: 10, marginTop: 4 },
   pickAudioPreview: { alignItems: 'center', paddingVertical: 14 },
   pickAudioIcon: { fontSize: 34 },
-  pickAudioMeta: { color: '#aebfc9', fontSize: 12, marginTop: 6 },
+  pickAudioMeta: { color: '#C9CFCE', fontSize: 12, marginTop: 6 },
   empty: { padding: 40, alignItems: 'center' },
   captureNotice: {
     color: '#d6a054', textAlign: 'center', fontSize: 11, lineHeight: 15,
     paddingHorizontal: 24, paddingVertical: 6, marginVertical: 4,
   },
-  emptyTxt: { color: '#41505b', fontSize: 13, textAlign: 'center', lineHeight: 20 },
-  vCard: { marginHorizontal: 12, marginTop: 8, borderRadius: 12, borderWidth: 1, borderColor: '#2a5147', backgroundColor: '#0f1a17' },
+  emptyTxt: { color: '#4A4A54', fontSize: 13, textAlign: 'center', lineHeight: 20 },
+  vCard: { marginHorizontal: 12, marginTop: 8, borderRadius: 12, borderWidth: 1, borderColor: '#3A3A44', backgroundColor: '#15151B' },
   vCardBody: { padding: 14 },
-  vCardTitle: { color: '#7cf4c8', fontSize: 13, fontWeight: '700', marginBottom: 4 },
-  vCardTxt: { color: '#9db0ba', fontSize: 12, lineHeight: 17 },
+  vCardTitle: { color: '#FFFFFF', fontSize: 13, fontWeight: '700', marginBottom: 4 },
+  vCardTxt: { color: '#8E9696', fontSize: 12, lineHeight: 17 },
   vCardRow: { flexDirection: 'row', alignItems: 'center', marginTop: 10 },
-  vCardBtn: { borderRadius: 8, backgroundColor: '#7cf4c8', paddingHorizontal: 12, paddingVertical: 8 },
-  vCardBtnTxt: { color: '#06231c', fontSize: 12, fontWeight: '700' },
+  vCardBtn: { borderRadius: 8, backgroundColor: '#FFFFFF', paddingHorizontal: 12, paddingVertical: 8 },
+  vCardBtnTxt: { color: '#0B0B0F', fontSize: 12, fontWeight: '700' },
   vCardSkip: { marginLeft: 10, padding: 6 },
-  vCardSkipTxt: { color: '#5a6c76', fontSize: 12 },
+  vCardSkipTxt: { color: '#5E6464', fontSize: 12 },
   // b126 verification panel
-  fpBox: { backgroundColor: '#0c141c', borderWidth: 1, borderColor: '#1f4a42', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 12, color: '#7cf4c8', fontSize: 13, lineHeight: 19, marginTop: 12 },
-  fpStepBtn: { alignItems: 'center', paddingVertical: 11, borderRadius: 10, borderWidth: 1, borderColor: '#22323d', marginTop: 12 },
-  fpStepBtnOn: { borderColor: '#7cf4c8', backgroundColor: 'rgba(124,244,200,0.08)' },
-  fpStepBtnTxt: { color: '#8fa5b0', fontSize: 13, fontWeight: '700' },
-  fpStepBtnTxtOn: { color: '#7cf4c8' },
+  fpBox: { backgroundColor: '#15151B', borderWidth: 1, borderColor: '#3A3A44', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 12, color: '#FFFFFF', fontSize: 13, lineHeight: 19, marginTop: 12 },
+  fpStepBtn: { alignItems: 'center', paddingVertical: 11, borderRadius: 10, borderWidth: 1, borderColor: '#24242D', marginTop: 12 },
+  fpStepBtnOn: { borderColor: '#FFFFFF', backgroundColor: 'rgba(255,255,255,0.08)' },
+  fpStepBtnTxt: { color: '#8E9696', fontSize: 13, fontWeight: '700' },
+  fpStepBtnTxtOn: { color: '#FFFFFF' },
   fpBtnDisabled: { opacity: 0.35 },
-  fpStatus: { color: '#9db0ba', fontSize: 12, textAlign: 'center', marginTop: 12, lineHeight: 17 },
-  fpPinned: { color: '#7cf4c8', fontSize: 13, fontWeight: '700', textAlign: 'center', marginTop: 12 },
-  composer: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'flex-end', padding: 12, borderTopWidth: 1, borderTopColor: '#141d25' },
-  input: { flex: 1, minWidth: 120, minHeight: 42, maxHeight: 110, borderRadius: 20, borderWidth: 1, borderColor: '#1c2a34', color: '#d7e2e8', paddingHorizontal: 14, paddingVertical: 10, fontSize: 14, backgroundColor: '#0e151c' },
+  fpStatus: { color: '#8E9696', fontSize: 12, textAlign: 'center', marginTop: 12, lineHeight: 17 },
+  fpPinned: { color: '#FFFFFF', fontSize: 13, fontWeight: '700', textAlign: 'center', marginTop: 12 },
+  composer: { flexDirection: 'row', flexWrap: 'wrap', alignItems: 'flex-end', paddingHorizontal: 10, paddingTop: 10, paddingBottom: 12, borderTopWidth: 1, borderTopColor: '#24242D', backgroundColor: '#0B0B0F', gap: 8 },
+  input: { flex: 1, minWidth: 120, minHeight: 40, maxHeight: 120, borderRadius: 20, borderWidth: 1, borderColor: '#24242D', color: '#FFFFFF', paddingHorizontal: 15, paddingTop: 10, paddingBottom: 10, fontSize: 15, backgroundColor: '#15151B' },
+  roundBtn: { width: 40, height: 40, borderRadius: 20, alignItems: 'center', justifyContent: 'center' },
+  roundBtnGhost: { backgroundColor: '#15151B', borderWidth: 1, borderColor: '#24242D' },
+  roundBtnSend: { backgroundColor: '#FFFFFF' },
+  roundBtnOff: { opacity: 0.4 },
+  recBar: { flex: 1, minHeight: 40, flexDirection: 'row', alignItems: 'center', borderRadius: 20, borderWidth: 1, borderColor: '#5c4526', backgroundColor: 'rgba(214,154,92,0.10)', paddingHorizontal: 15 },
+  recDot: { width: 9, height: 9, borderRadius: 5, backgroundColor: '#e8836f', marginRight: 8 },
+  recTxt: { color: '#d69a5c', fontSize: 14, fontWeight: '600' },
   inputLocked: { opacity: 0.5 },
   // b163: composer-level ceremony-gate notice (web P1.2 parity)
-  verifyNotice: { flexBasis: '100%', width: '100%', flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8, paddingLeft: 12, paddingRight: 4 },
-  verifyNoticeTxt: { flex: 1, color: '#e8a34a', fontSize: 12, lineHeight: 16 },
-  verifyNowBtn: { borderColor: '#7cf4c8', borderWidth: 1, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6 },
-  verifyNowBtnTxt: { color: '#7cf4c8', fontSize: 12, fontWeight: '700' },
+  verifyNotice: { flexBasis: '100%', width: '100%', flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 2, paddingLeft: 6, paddingRight: 2 },
+  verifyNoticeTxt: { flex: 1, color: '#d69a5c', fontSize: 12, lineHeight: 16 },
+  verifyNowBtn: { borderColor: '#FFFFFF', borderWidth: 1, borderRadius: 8, paddingHorizontal: 10, paddingVertical: 6 },
+  verifyNowBtnTxt: { color: '#FFFFFF', fontSize: 12, fontWeight: '700' },
   attachBtn: { marginLeft: 8, height: 42, width: 42, borderRadius: 21, alignItems: 'center', justifyContent: 'center' },
-  attachBtnOn: { backgroundColor: '#12202a' },
-  attachBtnOff: { backgroundColor: '#0e151c', opacity: 0.5 },
-  attachTxt: { fontSize: 20, color: '#7cf4c8' },
-  attachTxtOff: { color: '#3a4750' },
+  attachBtnOn: { backgroundColor: '#15151B' },
+  attachBtnOff: { backgroundColor: '#0B0B0F', opacity: 0.5 },
+  attachTxt: { fontSize: 20, color: '#FFFFFF' },
+  attachTxtOff: { color: '#5E6464' },
   sendBtn: { marginLeft: 8, borderRadius: 20, paddingHorizontal: 18, paddingVertical: 12 },
-  sendBtnOn: { backgroundColor: '#7cf4c8' },
-  sendBtnOff: { backgroundColor: '#12202a' },
-  sendTxt: { fontSize: 13, fontWeight: '700', color: '#2c3942' },
-  sendTxtOn: { color: '#06231c' },
-  pickOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.75)', alignItems: 'center', justifyContent: 'center', padding: 16, zIndex: 50, elevation: 50 },
-  pickSheet: { width: '100%', maxWidth: 340, borderRadius: 20, backgroundColor: '#101922', borderWidth: 1, borderColor: '#1c2a34', padding: 18, alignItems: 'center' },
-  pickTitle: { color: '#d7e2e8', fontSize: 15, fontWeight: '700', marginBottom: 12 },
-  pickPreview: { width: '100%', height: 240, borderRadius: 12, backgroundColor: '#0e151c' },
-  pickMeta: { color: '#7d919e', fontSize: 11, marginTop: 8 },
+  sendBtnOn: { backgroundColor: '#FFFFFF' },
+  sendBtnOff: { backgroundColor: '#15151B' },
+  sendTxt: { fontSize: 13, fontWeight: '700', color: '#5E6464' },
+  sendTxtOn: { color: '#0B0B0F' },
+  pickOverlay: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(11,11,15,0.75)', alignItems: 'center', justifyContent: 'center', padding: 16, zIndex: 50, elevation: 50 },
+  pickSheet: { width: '100%', maxWidth: 340, borderRadius: 20, backgroundColor: '#15151B', borderWidth: 1, borderColor: '#24242D', padding: 18, alignItems: 'center' },
+  pickTitle: { color: '#FFFFFF', fontSize: 15, fontWeight: '700', marginBottom: 12 },
+  pickPreview: { width: '100%', height: 240, borderRadius: 12, backgroundColor: '#0B0B0F' },
+  pickMeta: { color: '#8E9696', fontSize: 11, marginTop: 8 },
   pickBtns: { flexDirection: 'row', marginTop: 16 },
   dlToggle: { flexDirection: 'row', alignItems: 'center', marginTop: 14, alignSelf: 'flex-start' },
-  dlBox: { width: 18, height: 18, borderRadius: 5, borderWidth: 1.5, borderColor: '#2c3f4b', marginRight: 8, alignItems: 'center', justifyContent: 'center' },
-  dlBoxOn: { backgroundColor: '#123c31', borderColor: '#5fd4c4' },
-  dlBoxTxt: { color: '#5fd4c4', fontSize: 12, fontWeight: '700' },
-  dlToggleTxt: { color: '#8fa2ad', fontSize: 12 },
-  saveBtn: { marginTop: 6, alignSelf: 'flex-end', paddingVertical: 4, paddingHorizontal: 10, borderRadius: 8, backgroundColor: '#122430', borderWidth: 1, borderColor: '#1f3947' },
-  saveBtnTxt: { color: '#5fd4c4', fontSize: 11 },
-  pickCancel: { flex: 1, borderRadius: 14, backgroundColor: '#12202a', paddingVertical: 12, alignItems: 'center', marginRight: 8 },
-  pickCancelTxt: { color: '#9fb3c0', fontSize: 14, fontWeight: '600' },
-  pickSend: { flex: 1, borderRadius: 14, backgroundColor: '#7cf4c8', paddingVertical: 12, alignItems: 'center' },
-  pickSendTxt: { color: '#06231c', fontSize: 14, fontWeight: '700' },
-  lightbox: { flex: 1, backgroundColor: 'rgba(0,0,0,0.94)', alignItems: 'center', justifyContent: 'center', padding: 16 },
+  dlBox: { width: 18, height: 18, borderRadius: 5, borderWidth: 1.5, borderColor: '#3A3A44', marginRight: 8, alignItems: 'center', justifyContent: 'center' },
+  dlBoxOn: { backgroundColor: '#24242D', borderColor: '#FFFFFF' },
+  dlBoxTxt: { color: '#FFFFFF', fontSize: 12, fontWeight: '700' },
+  dlToggleTxt: { color: '#8E9696', fontSize: 12 },
+  saveBtn: { marginTop: 6, alignSelf: 'flex-end', paddingVertical: 4, paddingHorizontal: 10, borderRadius: 8, backgroundColor: '#15151B', borderWidth: 1, borderColor: '#24242D' },
+  saveBtnTxt: { color: '#FFFFFF', fontSize: 11 },
+  pickCancel: { flex: 1, borderRadius: 14, backgroundColor: '#15151B', paddingVertical: 12, alignItems: 'center', marginRight: 8 },
+  pickCancelTxt: { color: '#8E9696', fontSize: 14, fontWeight: '600' },
+  pickSend: { flex: 1, borderRadius: 14, backgroundColor: '#FFFFFF', paddingVertical: 12, alignItems: 'center' },
+  pickSendTxt: { color: '#0B0B0F', fontSize: 14, fontWeight: '700' },
+  lightbox: { flex: 1, backgroundColor: 'rgba(11,11,15,0.94)', alignItems: 'center', justifyContent: 'center', padding: 16 },
   lightboxImg: { width: '100%', height: '82%' },
-  lightboxHint: { color: '#7d919e', fontSize: 11, marginTop: 14 },
+  lightboxHint: { color: '#8E9696', fontSize: 11, marginTop: 14 },
   // b140: soft large-file warning in the pick preview (send still allowed)
   pickWarn: { color: '#e8a33d', fontSize: 11, marginTop: 6, marginHorizontal: 18, textAlign: 'center' },
   // b140: full-screen video player
-  videoFSBg: { flex: 1, backgroundColor: '#000000' },
+  videoFSBg: { flex: 1, backgroundColor: '#0B0B0F' },
   videoFSPlayer: { flex: 1 },
-  videoFSClose: { position: 'absolute', top: 54, right: 20, width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(0,0,0,0.55)', alignItems: 'center', justifyContent: 'center' },
-  videoFSCloseTxt: { color: '#ffffff', fontSize: 20, lineHeight: 22 },
-  videoFSHint: { color: '#7d919e', fontSize: 11, textAlign: 'center', paddingVertical: 10 },
+  videoFSClose: { position: 'absolute', top: 54, right: 20, width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(11,11,15,0.55)', alignItems: 'center', justifyContent: 'center' },
+  videoFSCloseTxt: { color: '#FFFFFF', fontSize: 20, lineHeight: 22 },
+  videoFSHint: { color: '#8E9696', fontSize: 11, textAlign: 'center', paddingVertical: 10 },
 
   // b187: lounge read-only notice
   loungeNoteTxt: {
     flexBasis: '100%',
     width: '100%',
-    color: '#7cf4c8',
+    color: '#FFFFFF',
     fontSize: 12,
     textAlign: 'center',
     paddingBottom: 6,

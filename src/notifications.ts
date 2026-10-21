@@ -9,7 +9,36 @@
  */
 import * as Notifications from 'expo-notifications';
 import Constants from 'expo-constants';
+import { Platform } from 'react-native';
 import { CallManager } from './calls/CallManager';
+import { withSystemSheet } from './lock-hold';
+import { isUnifiedPushAvailable, ensureEndpoint, storedEndpoint, unregisterUnifiedPush, upTokenFor } from './unifiedpush';
+
+// b199 ANDROID CHANNELS (Android handover TODO, owner OK Oct 17). Android
+// shows a push only as loudly as its channel allows, and a channel's
+// importance is fixed once created on a device — so both are made here, at
+// module load, before the first push can arrive. 'default' is what Expo
+// uses for any push without a channelId (messages): HIGH, so it heads-up
+// like the iOS banner. 'calls' is MAX for the "Incoming call" burst; the
+// relay names it per push (channelId "calls"), and until that relay change
+// is live call pushes land on 'default', which still alerts. Lock-screen
+// text is the contentless body by design ("Notification" / "Incoming
+// call"), so PUBLIC visibility leaks nothing. iOS ignores all of this.
+if (Platform.OS === 'android') {
+  void Notifications.setNotificationChannelAsync('default', {
+    name: 'Messages',
+    importance: Notifications.AndroidImportance.HIGH,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+    vibrationPattern: [0, 250, 250, 250],
+  }).catch(() => undefined);
+  void Notifications.setNotificationChannelAsync('calls', {
+    name: 'Calls',
+    importance: Notifications.AndroidImportance.MAX,
+    lockscreenVisibility: Notifications.AndroidNotificationVisibility.PUBLIC,
+    vibrationPattern: [0, 600, 800, 600, 800],
+    bypassDnd: false,
+  }).catch(() => undefined);
+}
 
 
 // b77 FIX: the handler below used to return the SAME suppressed result for
@@ -82,7 +111,7 @@ export async function notifyNewInvite(): Promise<void> {
     if (now - lastInviteNotifyAt < NOTIFY_INVITE_MIN_INTERVAL_MS) return;
     lastInviteNotifyAt = now;
     await Notifications.scheduleNotificationAsync({
-      content: { title: 'VEIL', body: 'New chat invite', data: { veilLocal: true } },
+      content: { title: 'Vardum', body: 'New chat invite', data: { veilLocal: true } },
       trigger: null,
     });
   } catch { /* notifications are best-effort */ }
@@ -95,7 +124,7 @@ export async function notifyNewMessage(): Promise<void> {
     if (now - lastNotifyAt < NOTIFY_MIN_INTERVAL_MS) return;
     lastNotifyAt = now;
     await Notifications.scheduleNotificationAsync({
-      content: { title: 'VEIL', body: 'Notification', data: { veilLocal: true } },
+      content: { title: 'Vardum', body: 'Notification', data: { veilLocal: true } },
       trigger: null,
     });
   } catch { /* notifications are best-effort */ }
@@ -103,18 +132,24 @@ export async function notifyNewMessage(): Promise<void> {
 
 export async function ensurePushPermission(): Promise<boolean> {
   try {
-    const cur = (await Notifications.getPermissionsAsync()) as unknown as { status: string };
+    const cur = (await Notifications.getPermissionsAsync()) as unknown as { status: string; canAskAgain?: boolean };
     if (cur.status === 'granted') return true;
     // ask ONCE: after a denial never re-prompt automatically (the OS keeps
-    // its answer; repeated requests are the "endless permission prompts")
-    if (cur.status === 'denied') return false;
-    const req = (await Notifications.requestPermissionsAsync()) as unknown as { status: string };
+    // its answer; repeated requests are the "endless permission prompts").
+    // b199 (ZTE device run): Android 13+ reports "denied" BEFORE the first
+    // ask, with canAskAgain=true — that is "never asked", not a refusal, and
+    // reading it as a refusal meant Android never showed the prompt at all.
+    if (cur.status === 'denied' && cur.canAskAgain === false) return false;
+    if (cur.status === 'denied' && Platform.OS !== 'android') return false;
+    const req = (await withSystemSheet(() => Notifications.requestPermissionsAsync())) as unknown as { status: string };
     return req.status === 'granted';
   } catch { return false; }
 }
 
 /** Relay + keychain shapes (injected — keeps this module pure for tests). */
 export interface PushRegistrationDeps {
+  /** Batch H (round-6 review R6-3-09): relay functions (veilPushReset) */
+  invoke?: (fn: string, payload: Record<string, unknown>) => Promise<unknown>;
   entityCreate: (entity: string, record: Record<string, unknown>) => Promise<unknown>;
   /** user-scoped entity LIST (own rows only) — used to dedupe before create */
   entityList: (entity: string, params: Record<string, string | number>) => Promise<unknown>;
@@ -131,7 +166,8 @@ export interface PushRegistrationDeps {
  */
 export async function registerPushToken(relay: PushRegistrationDeps): Promise<boolean> {
   try {
-    const token = await getPushToken();
+    const target = await resolvePushTarget();
+    const token = target?.token ?? null;
     if (!token) {
       console.log('[veil-push] registerPushToken: no token available — relay NOT updated');
       return false;
@@ -160,7 +196,11 @@ export async function registerPushToken(relay: PushRegistrationDeps): Promise<bo
         }
       }
     } catch { /* list unavailable (offline) — fall through to create */ }
-    await relay.entityCreate('VeilPushToken', { expo_token: token });
+    // Batch H (round-6 review R6-3-09): this phone's earlier rows (an older token or
+    // endpoint) go first, so a stale row never keeps delivering
+    const deviceId = await pushDeviceId(relay);
+    if (deviceId && relay.invoke) await relay.invoke('veilPushReset', { device_id: deviceId }).catch(() => undefined);
+    await relay.entityCreate('VeilPushToken', { expo_token: token, ...(target?.extra ?? {}), ...(deviceId ? { device_id: deviceId } : {}) });
     await relay.setCached(key, token);
     console.log('[veil-push] registered new token with relay');
     return true;
@@ -177,11 +217,79 @@ export async function registerPushToken(relay: PushRegistrationDeps): Promise<bo
  * which point the registration effect in App.tsx re-registers it.
  * Server-side the rows are user-scoped, so deleting own rows is authorized.
  */
+/**
+ * Batch G (round-5 review R5-3-04): the wipe-time unregister. It uses ONLY the
+ * token cached at registration: no permission request and no fresh token from
+ * the OS, so a duress wipe never raises a system prompt. No cached token, nothing to do.
+ */
+/** Batch H (round-6 reviews R6-1-01 / R6-3-10): what a wipe unregisters, read
+ *  BEFORE the local wipe deletes the cached token. */
+export interface PushTarget { token: string; up: boolean; /** Batch H (R6-3-09) */ deviceId?: string }
+
+/** Batch H (round-6 review R6-3-09): a random id for this install's push rows, so
+ *  the phone can remove its own earlier rows (kept through Nothing-at-Rest wipes). */
+export const PUSH_DEVICE_KEY = 'veil_push_device_v1';
+async function pushDeviceId(relay: Pick<PushRegistrationDeps, 'getCached' | 'setCached'>): Promise<string> {
+  try {
+    const have = await relay.getCached(PUSH_DEVICE_KEY);
+    if (have && /^[A-Za-z0-9_-]{4,64}$/.test(have)) return have;
+    const id = 'pd' + Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => b.toString(16).padStart(2, '0')).join('');
+    await relay.setCached(PUSH_DEVICE_KEY, id);
+    return id;
+  } catch { return ''; }
+}
+
+/** Batch H (R6-3-08): log the push host, never the endpoint (the topic is a capability) */
+function pushHostOf(url: string): string {
+  try { return new URL(url).host; } catch { return '?'; }
+}
+
+/** Batch H: read this phone's push target without asking the OS (no prompt):
+ *  the UnifiedPush endpoint from the app's own store, else the cached token. */
+export async function capturePushTarget(getCached: (key: string) => Promise<string | null>): Promise<PushTarget | null> {
+  try {
+    const upEp = Platform.OS === 'android' ? storedEndpoint() : null;
+    const deviceId = (await getCached(PUSH_DEVICE_KEY).catch(() => null)) || undefined;
+    if (upEp) return { token: upTokenFor(upEp), up: true, deviceId };
+    const token = (await getCached('veil_push_token_cached_v2')) || (await getCached('veil_push_token_cached')) || '';
+    return token || deviceId ? { token, up: false, deviceId } : null;
+  } catch { return null; }
+}
+
+export async function unregisterCachedPushToken(relay: PushRegistrationDeps & {
+  entityDelete: (entity: string, id: string) => Promise<unknown>;
+}, target?: PushTarget | null): Promise<void> {
+  // a wipe passes the target it read before wiping; other callers read it now
+  const t = target !== undefined ? target : await capturePushTarget((k) => relay.getCached(k));
+  // Batch H (R6-1-03 = R6-3-02): release the UnifiedPush registration FIRST. It is
+  // local and needs no network, so an offline or slow wipe still leaves no live
+  // push address (it used to run only after the relay answered).
+  if (t?.up) { try { unregisterUnifiedPush(); } catch { /* best-effort */ } }
+  try {
+    if (t?.token) {
+      const listed = (await relay.entityList('VeilPushToken', { expo_token: t.token })) as unknown;
+      const rows = (Array.isArray(listed) ? listed : ((listed as { data?: unknown[] })?.data ?? [])) as Record<string, unknown>[];
+      for (const r of rows) {
+        if (String(r.expo_token ?? '') === t.token && r.id) await relay.entityDelete('VeilPushToken', String(r.id)).catch(() => undefined);
+      }
+    }
+  } catch { /* best-effort */ }
+  // Batch H (R6-3-09): and every earlier row of this phone (an older token or endpoint)
+  if (t?.deviceId && relay.invoke) await relay.invoke('veilPushReset', { device_id: t.deviceId }).catch(() => undefined);
+  // after a wipe the cached markers are already gone; don't write them back
+  if (target === undefined) {
+    await relay.setCached('veil_push_token_cached', '').catch(() => undefined);
+    await relay.setCached('veil_push_token_cached_v2', '').catch(() => undefined);
+  }
+}
+
 export async function unregisterPushToken(relay: PushRegistrationDeps & {
   entityDelete: (entity: string, id: string) => Promise<unknown>;
 }): Promise<void> {
   try {
-    const token = await getPushToken();
+    // GrapheneOS path: the relay row is keyed by the UnifiedPush endpoint
+    const upEp = Platform.OS === 'android' ? storedEndpoint() : null;
+    const token = upEp ? upTokenFor(upEp) : await getPushToken();
     if (token) {
       const listed = (await relay.entityList('VeilPushToken', { expo_token: token })) as unknown;
       const rows = (Array.isArray(listed) ? listed : ((listed as { data?: unknown[] })?.data ?? [])) as Record<string, unknown>[];
@@ -194,7 +302,42 @@ export async function unregisterPushToken(relay: PushRegistrationDeps & {
     // cached marker dies too — a later re-register (post phrase-restore) must
     // actually create a fresh row, not skip on the stale cache
     await relay.setCached('veil_push_token_cached', '');
+    await relay.setCached('veil_push_token_cached_v2', '');
+    // also drop the distributor registration, so a wiped phone holds no live
+    // push address at all; phrase restore registers a fresh one
+    if (upEp) unregisterUnifiedPush();
   } catch { /* best-effort: offline wipe retries at next boot */ }
+}
+
+/**
+ * Where this device's contentless pings should go.
+ * Android with a UnifiedPush distributor (ntfy) installed — the GrapheneOS
+ * path, no Google — files the distributor endpoint + its Web Push keys.
+ * Everything else uses the Expo token as before.
+ *
+ * The relay row keeps the same shape (expo_token is the lookup key, here
+ * "up:<endpoint>"), plus up_* fields the relay uses to send a Web Push
+ * (RFC 8030/8291) ping instead of an Expo one.
+ */
+async function resolvePushTarget(): Promise<{ token: string; extra?: Record<string, string> } | null> {
+  if (Platform.OS === 'android' && isUnifiedPushAvailable()) {
+    if (!(await ensurePushPermission())) {
+      console.log('[veil-push] permission not granted — skipping UnifiedPush registration');
+      return null;
+    }
+    const ep = await ensureEndpoint();
+    if (!ep) return null;
+    console.log(`[veil-push] UnifiedPush endpoint OK (${pushHostOf(ep.url)})`); // Batch H (R6-3-08)
+    return {
+      token: upTokenFor(ep),
+      extra: { transport: 'unifiedpush', up_endpoint: ep.url, up_p256dh: ep.pubKey, up_auth: ep.auth },
+    };
+  }
+  if (Platform.OS === 'android') {
+    console.log('[veil-push] no UnifiedPush distributor installed (install ntfy for push on GrapheneOS) — trying Expo/FCM');
+  }
+  const t = await getPushToken();
+  return t ? { token: t } : null;
 }
 
 /**

@@ -1,0 +1,14 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <application>
+    <!-- Receives endpoints and pings from the UnifiedPush distributor (ntfy).
+         Not exported: the connector's own receiver forwards to it in-process. -->
+    <service
+      android:name="app.tryvardum.unifiedpush.VardumPushService"
+      android:exported="false">
+      <intent-filter>
+        <action android:name="org.unifiedpush.android.connector.PUSH_EVENT" />
+      </intent-filter>
+    </service>
+  </application>
+</manifest>

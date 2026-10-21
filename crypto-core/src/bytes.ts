@@ -16,8 +16,15 @@ export function fromUtf8(b: Uint8Array): string {
 }
 
 export function toB64(bytes: Uint8Array): string {
+  // b199 (owner hardware test Oct 16: a 2.4 MB photo took up to 12 s around
+  // the native AES call): one String.fromCharCode per byte is millions of
+  // tiny string appends under Hermes. Build the binary string in chunks
+  // instead (8 KB at a time) — same output, a fraction of the work.
+  const CHUNK = 0x2000; // 8 KB: well inside Hermes's argument-count limit for apply()
   let s = '';
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK) as unknown as number[]);
+  }
   return btoaSafe(s);
 }
 

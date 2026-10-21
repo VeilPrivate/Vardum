@@ -1,0 +1,7 @@
+{
+  "name": "vardum-unifiedpush",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.ts",
+  "description": "Vardum local Expo module (Android): Google-free push via UnifiedPush (ntfy). Contentless banners rendered natively, even when the app is closed."
+}

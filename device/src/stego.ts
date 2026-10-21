@@ -28,7 +28,10 @@ function magicBytes(): Uint8Array {
 
 /** web J(): capacity in BITS — floor(pixels) * 3 channel bytes. */
 export function stegoCapacityBits(rgbaByteLength: number): number {
-  return Math.floor(rgbaByteLength / 4) * 3 * 8;
+  // Batch E (F-7): ONE bit per R, G, B byte. This used to multiply by 8 more, so
+  // the capacity checks passed for carriers 8x too small and lsbEmbed silently
+  // wrote a truncated stream.
+  return Math.floor(rgbaByteLength / 4) * 3;
 }
 
 /** web rt(): optional-payload encryption — salt16 + iv12 + AES-256-GCM. */
@@ -65,7 +68,12 @@ export async function decryptStegoPayload(payload: Uint8Array, passphrase: strin
 }
 
 /** web at(): build the full embedded stream for an RGBA buffer. */
-export async function buildStegoStream(message: string, passphrase: string | null): Promise<Uint8Array> {
+export async function buildStegoStream(message: string, passphrase: string | null, rgbaLength?: number): Promise<Uint8Array> {
+  // Batch E (Superagent round 3, F-7): check the carrier's room BEFORE the (slow)
+  // passphrase encryption. Encrypted payloads add salt 16 + iv 12 + tag 16 bytes.
+  if (rgbaLength !== undefined && (STEGO_HEADER_BYTES + utf8(message).length + (passphrase ? 44 : 0)) * 8 > stegoCapacityBits(rgbaLength)) {
+    throw new Error('Image is too small to hold this message');
+  }
   const payload = passphrase ? await encryptStegoPayload(message, passphrase) : utf8(message);
   if (payload.length === 0) throw new Error('Message is empty');
   if (payload.length > STEGO_MAX_PAYLOAD) throw new Error('Message exceeds the 256 KB limit');
@@ -108,7 +116,7 @@ export function lsbExtract(rgba: Uint8Array, byteCount: number): Uint8Array {
 export async function extractStego(rgba: Uint8Array, passphrase: string | null): Promise<string> {
   const header = lsbExtract(rgba, STEGO_HEADER_BYTES);
   if (new TextDecoder().decode(header.slice(0, 8)) !== STEGO_MAGIC) {
-    throw new Error('No VEIL payload found in this image');
+    throw new Error('No Vardum payload found in this image');
   }
   const encrypted = header[8] === 1;
   const payloadLen = new DataView(header.buffer).getUint32(9);

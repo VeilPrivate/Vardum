@@ -21,6 +21,7 @@
  * web copy's wording alone might suggest.
  */
 import * as Keychain from 'react-native-keychain';
+import { Platform } from 'react-native';
 import type { SecureStore } from '../vendor/device/src/index';
 import { AUTH_SESSION_KEY } from '../vendor/device/src/auth';
 
@@ -132,7 +133,75 @@ export interface RnSecureStoreOptions {
   isHardwareGated?: () => boolean;
 }
 
+/**
+ * Android read cache. Every react-native-keychain item on Android is its own
+ * Keystore key, and every read is a hardware AES op (on the Pixel 8 Pro the
+ * old keys sit in the Titan M2 StrongBox: 100-300 ms each, all on one native
+ * queue). The background loops re-read the same items every few seconds, so
+ * a chat tap waited behind seconds of queued reads (device log Oct 20).
+ * iOS reads are already fast, so iOS keeps the direct path.
+ * The values are the same ones the app holds decrypted in memory anyway; the
+ * hardware-gated identity entry is never cached (its OS prompt must stay).
+ */
+const CACHE_ON = Platform.OS === 'android';
+const cache = new Map<string, string | null>();
+const inflight = new Map<string, Promise<string | null>>();
+const version = new Map<string, number>();
+function bump(key: string): void { version.set(key, (version.get(key) ?? 0) + 1); inflight.delete(key); }
+
+/** Android: an entry whose ciphertext the Keystore can no longer open (old
+ *  StrongBox keys fail large finishes with IllegalBlockSizeException). It will
+ *  never decrypt, so it reads as missing instead of throwing on every poll and
+ *  blocking the chat open; the next write replaces it with a TEE-keyed copy. */
+function isUnreadableEntry(e: unknown): boolean {
+  return Platform.OS === 'android' && /Could not decrypt data with alias/.test(String((e as Error)?.message ?? e));
+}
+const unreadableLogged = new Set<string>();
+
 export function createRnSecureStore(opts: RnSecureStoreOptions = {}): SecureStore {
+  const direct = createDirectStore(opts);
+  if (!CACHE_ON) return direct;
+  return {
+    async get(key) {
+      if (key === HARDWARE_GATED_KEY) return direct.get(key);
+      if (cache.has(key)) return cache.get(key) ?? null;
+      const pending = inflight.get(key);
+      if (pending) return pending;
+      const v0 = version.get(key) ?? 0;
+      const p = (async () => {
+        let value: string | null;
+        try {
+          value = await direct.get(key);
+        } catch (e) {
+          if (!isUnreadableEntry(e)) throw e;
+          if (!unreadableLogged.has(key)) {
+            unreadableLogged.add(key);
+            console.log(`[veil-secure] unreadable entry treated as missing: ${key}`);
+          }
+          value = null;
+        }
+        if ((version.get(key) ?? 0) === v0) cache.set(key, value);
+        return value;
+      })();
+      inflight.set(key, p);
+      try { return await p; } finally { if (inflight.get(key) === p) inflight.delete(key); }
+    },
+    async set(key, value) {
+      bump(key);
+      cache.delete(key);
+      try { await direct.set(key, value); } finally { bump(key); } // a read that raced the write must not cache the old value
+      if (key !== HARDWARE_GATED_KEY) cache.set(key, value);
+    },
+    async delete(key) {
+      bump(key);
+      cache.delete(key);
+      try { await direct.delete(key); } finally { bump(key); }
+      cache.set(key, null);
+    },
+  };
+}
+
+function createDirectStore(opts: RnSecureStoreOptions): SecureStore {
   return {
     async get(key) {
       try {
@@ -146,7 +215,7 @@ export function createRnSecureStore(opts: RnSecureStoreOptions = {}): SecureStor
         // for the one gated key makes the OS reliably show the biometric UI
         // instead of guessing.
         const getOpts = key === HARDWARE_GATED_KEY
-          ? { service: `veil.${key}`, authenticationPrompt: { title: 'Unlock Veil', subtitle: 'Confirm to access your identity keys' } }
+          ? { service: `veil.${key}`, authenticationPrompt: { title: 'Unlock Vardum', subtitle: 'Confirm to access your identity keys' } }
           : { service: `veil.${key}` };
         const rc = await Keychain.getGenericPassword(getOpts);
         if (!rc) return null;
@@ -287,5 +356,11 @@ export function secureEnclaveAvailable(): boolean {
 export async function resetSecureEnclaveKey(): Promise<boolean> {
   const mod = nativeSe();
   if (!mod?.seResetKey || !mod?.seIsAvailable?.()) return false;
-  try { return !!(await mod.seResetKey()); } catch { return false; }
+  // Batch E (round-3 review R1-02): a failed reset is an error, not "no hardware".
+  // The callers' try blocks then stop the mode flip / re-seal instead of sealing
+  // under the old (ungated) key and reporting hardware mode.
+  let ok = false;
+  try { ok = !!(await mod.seResetKey()); } catch (e) { throw new Error(`Secure Enclave key reset failed: ${String((e as Error)?.message ?? e)}`); }
+  if (!ok) throw new Error('Secure Enclave key reset failed');
+  return true;
 }

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Status-bar icon: the Vardum chat bubble with the V cut out (assets/src/mark.svg
+     geometry). White on transparent; Android tints it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="76"
+    android:viewportHeight="76">
+  <group android:translateX="-12" android:translateY="-14">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M32,18H68A16,16 0,0 1,84 34V56A16,16 0,0 1,68 72H32A16,16 0,0 1,16 56V34A16,16 0,0 1,32 18Z M34,30H45L50,44L55,30H66L50,62Z" />
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M28,66L28,86L46,70Z" />
+  </group>
+</vector>

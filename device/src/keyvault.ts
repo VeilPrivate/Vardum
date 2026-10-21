@@ -31,6 +31,9 @@ export interface KeyvaultIdentity {
   spkSigB64: string;
   pqPubB64: string;
   pqPrivB64: string;
+  /** b54: Ed25519(IK, label || pq_pub), published as pq_sig. Absent on
+   *  pre-b54 keyvaults until ensurePqPrekeySigned() backfills it. */
+  pqSigB64?: string;
   createdAt: string;
 }
 

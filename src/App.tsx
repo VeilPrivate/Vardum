@@ -1,18 +1,19 @@
-import { secureRemove } from '../vendor/device/src/secure-wipe';
+import { secureRemove, wipeAndVerify } from '../vendor/device/src/secure-wipe';
 import { CallManager } from './calls/CallManager';
 import { CallOverlay } from './components/CallOverlay';
-import { adoptNotesIdentityKey, NOTES_KEY_STORAGE } from '../vendor/device/src/notes';
+import { adoptNotesIdentityKey, NOTES_KEY_STORAGE, noteMetaOf } from '../vendor/device/src/notes';
 import { secureEnclaveAvailable, keyvaultEntrySealed, resetSecureEnclaveKey } from './secure-store.rn';
 import React, { useEffect, useRef, useState, useCallback } from 'react';
-import { Alert, AppState, ActivityIndicator, Linking, View, Text, StyleSheet, Image, Keyboard, SafeAreaView } from 'react-native';
+import { Alert, AppState, ActivityIndicator, Linking, View, Text, StyleSheet, Image, Keyboard, SafeAreaView, Platform } from 'react-native';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as LocalAuthentication from 'expo-local-authentication';
 import * as ScreenCapture from 'expo-screen-capture';
 import { Audio } from 'expo-av';
 import { startScreenWatch } from './screen-watch';
-import { createVeilApp, VEIL_BASE_URL, type VeilApp } from './veil-app';
+import { createVeilApp, VEIL_BASE_URL, VEIL_SITE_URL, type VeilApp } from './veil-app';
 import { purgeIfFreshInstall } from './fresh-install-guard';
 
-import { createDeviceTransfer, receiveDeviceTransfer } from '../vendor/device/src/transfer';
+import { createDeviceTransfer, receiveDeviceTransfer, finishTransferMove, loadPendingTransfers, retireTransferredSessions, clearPendingTransfer, markTransferAsked } from '../vendor/device/src/transfer';
 import { createInviteSession, joinInviteSession } from '../vendor/device/src/invite';import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system';
 import * as MediaLibrary from 'expo-media-library';
@@ -20,8 +21,11 @@ import { LoginScreen } from './screens/LoginScreen';
 import { OtpScreen } from './screens/OtpScreen';
 import { MainScreen } from './screens/MainScreen';
 import { IdentityScreen } from './screens/IdentityScreen';
-import { ChatScreen, type ChatMessageUI, type PendingPick } from './screens/ChatScreen';
+import { ChatScreen, MEDIA_GONE, type ChatMessageUI, type PendingPick } from './screens/ChatScreen';
 import { LockScreen } from './screens/LockScreen';
+
+/** b199: photos are shrunk to this long edge (px) before encrypting + sending */
+const MEDIA_PHOTO_MAX_EDGE = 2048;
 
 /** auto-lock §0: shared module-level last-interaction clock. The root view's
  *  touch responder lives outside <VeilApp/>'s scope, so the inactivity clock
@@ -43,7 +47,7 @@ function friendlyError(e: unknown, what: string): string {
   if (s.includes('network') || s.includes('timeout') || s.includes('fetch') || s.includes('request failed'))
     return 'Connection problem — check your internet and try again.';
   if (s.includes('permission') || s.includes('not authorized') || s.includes('denied'))
-    return 'A permission was declined — check VEIL in iPhone Settings, then try again.';
+    return PERMISSION_DECLINED;
   if (s.includes('100 mb') || s.includes('25 mb') || s.includes('too large') || s.includes('size'))
     return 'That file is too large — the limit is 25 MB per message.';
   if (s.includes('session not found') || s.includes('no longer') || s.includes('gone'))
@@ -51,7 +55,7 @@ function friendlyError(e: unknown, what: string): string {
   if (s.includes('credentials') || s.includes('password') || s.includes('email'))
     return 'Those sign-in details did not work — check them and try again.';
   if (s.includes('biometr') || s.includes('face id') || s.includes('keychain'))
-    return 'Face ID / keychain could not complete — try again.';
+    return `${BIOMETRIC_SHORT} / secure storage could not complete — try again.`;
   if (s.includes('rate limit'))
     // b175 (owner Metro repro, Oct 2: burst send surfaced a raw-feeling
     // "Something went wrong" during a transient relay throttle): the relay's
@@ -65,25 +69,105 @@ function friendlyError(e: unknown, what: string): string {
 const veilActivityPing = () => { VEIL_LAST_ACTIVITY = Date.now(); };
 import { OnboardingScreen } from './screens/OnboardingScreen';
 import { AttributionSheet } from './screens/AttributionSheet';
+import { autoLockHeld, withSystemSheet, systemSheetExpected, expectSystemSheet } from './lock-hold';
 import { WelcomeScreen, fetchLoungePayload } from './screens/WelcomeScreen';
 import { type AppLockRecord, type LockoutState, MAX_ATTEMPTS } from '../vendor/device/src/applock';
 import { relayTimestampToIso } from '../vendor/device/src/time';
-import { registerPushToken, unregisterPushToken, notifyNewMessage, notifyNewInvite } from './notifications';
+import { relaySessionLiveness } from '../vendor/device/src/session-liveness';
+import { burnWindow, userText, locallyVerified, markLocallyVerified, clearLocalVerification } from '../vendor/device/src/chat';
+import { sealedPeer, sealedPeerMatches, pickContactSession } from '../vendor/device/src/contact';
+import { registerPushToken, unregisterCachedPushToken, capturePushTarget, type PushTarget, notifyNewMessage, notifyNewInvite } from './notifications';
+import { runDuressWipe } from './duress-wipe'; // Batch I (V-01)
+
+/** Batch G (round-5 review R5-1-04): names the user gave invite chats, per chat */
+const THREAD_NAMES_KEY = 'veil_thread_names_v1';
+/** Call quality (20 Oct 2026): poll cadence while a call is ringing or connecting */
+const CALL_SETUP_POLL_MS = 750;
+async function loadThreadNames(storage: { get(k: string): Promise<string | null> }): Promise<Record<string, string>> {
+  try { const raw = await storage.get(THREAD_NAMES_KEY); const v = raw ? JSON.parse(raw) as unknown : {}; return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, string> : {}; } catch { return {}; }
+}
+
+/** Batch F (round-4 review R4-4-17): every wipe drops this phone's push
+ *  registration on the relay (while still signed in), so a wiped phone gets no
+ *  more banners. It used to happen only on a Nothing-at-Rest lock.
+ *  Batch H (round-6 reviews R6-1-01 / R6-3-10): a wipe reads the target BEFORE
+ *  wiping (the wipe deletes the cached token) and unregisters AFTER the local wipe
+ *  has started, passing the target it read. */
+async function dropPushRegistration(a: { relay: { invoke(fn: string, p: Record<string, unknown>): Promise<unknown>; entityCreate(e: string, r: Record<string, unknown>): Promise<unknown>; entityList(e: string, p: Record<string, string | number>): Promise<unknown>; entityDelete(e: string, id: string): Promise<unknown> }; storage: { get(k: string): Promise<string | null>; set(k: string, v: string): Promise<unknown> } } | null | undefined, target?: PushTarget | null): Promise<void> {
+  if (!a) return;
+  // Batch G (R5-3-04): the cached token only (no OS prompt), and never more than 3 s
+  try {
+    await Promise.race([
+      unregisterCachedPushToken({
+        invoke: (fn, p) => a.relay.invoke(fn, p), // Batch H (R6-3-09)
+        entityCreate: (e, r) => a.relay.entityCreate(e, r),
+        entityList: (e, pr) => a.relay.entityList(e, pr),
+        entityDelete: (e, id) => a.relay.entityDelete(e, id),
+        getCached: (k) => a.storage.get(k),
+        setCached: (k, v) => a.storage.set(k, v) as never,
+      }, target),
+      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+    ]);
+  } catch { /* never block a wipe on the network */ }
+}
+
+/** Batch H (R6-1-01): read the push target before a wipe deletes the cached token */
+/** Batch I (local review V-03): save a key-change revocation, retrying a
+ *  refused save (2, 4, 8, 16, 32 s). The in-memory revocation set keeps the
+ *  send gate closed meanwhile; a save that never lands is logged, not hidden. */
+function persistRevocation(sessions: Parameters<typeof clearLocalVerification>[0], token: string, attempt = 0): void {
+  clearLocalVerification(sessions, token).catch((e: Error) => {
+    if (attempt >= 4) { console.log(`[veil] revocation for ${token.slice(0, 6)}… not saved after retries: ${e.message}`); return; }
+    setTimeout(() => persistRevocation(sessions, token, attempt + 1), 2000 * 2 ** attempt);
+  });
+}
+
+async function capturePushTargetOf(a: { storage: { get(k: string): Promise<string | null> } } | null | undefined): Promise<PushTarget | null> {
+  return a ? capturePushTarget((k) => a.storage.get(k)) : null;
+}
+
+/** Batch H (round-6 review R6-1-02): crypto-shred the hardware-mode identity at a
+ *  wipe. The gated key is deleted without a write (a write showed a biometric
+ *  prompt on Android); resetting the hardware wrap key makes any surviving copy
+ *  of the wrapped blob useless. Key generation needs no biometric, so no prompt. */
+async function shredHardwareKey(): Promise<void> {
+  try { if (secureEnclaveAvailable()) await resetSecureEnclaveKey().catch(() => false); } catch { /* best-effort, silent */ }
+}
+
+/** Batch H (round-6 review R6-1-08): the self-destruct clock has run out */
+function selfDestructDue(st: VeilSettings): boolean {
+  return !!(st.selfDestruct && st.selfDestructArmedAt && Date.now() - st.selfDestructArmedAt >= SELF_DESTRUCT_HOURS * 3600000);
+}
+
+/** Batch H (R6-1-08): the self-destruct wipe. It never reads the identity, so it
+ *  also runs when the hardware-mode identity can't be read (a cancelled Face ID). */
+async function selfDestructWipe(a: VeilApp): Promise<void> {
+  const pushTarget = await capturePushTargetOf(a);
+  for (const k of await a.storage.keys('veil_')) {
+    if (k === 'veil_auth_session') continue;
+    await secureRemove(a.storage, k).catch(() => undefined); // Batch F: overwrite, then delete
+  }
+  await shredHardwareKey();
+  await dropPushRegistration(a, pushTarget); // Batch F (R4-4-17); Batch H: after the local wipe
+}
 import * as Notifications from 'expo-notifications';
 import { createIdentity, restoreIdentity, type VeilIdentityMaterial } from '../vendor/crypto-core/src/index';
-import { provisionIdentity, restoreFromPhrase, createOneTapSession, acceptOneTapSession, syncChat, sendChatMessage, sendCoverEnvelope, sendReadReceipt, completeContactHandshake, sendMediaMessage, loadMediaFile, markEnvelopeDisplayed, markEnvelopesDisplayed, MEDIA_LIMIT_BYTES,
-  createGroup, joinGroup, pollGroupInbox, sendGroupMessage, sendGroupReceipt, sendGroupMediaMessage, rotateGroup, evictGroupMember, groupRowLabel, loadGroupRecord, loadGroupRecords, saveGroupRecord, groupRecord, findMainGroupSession, forgetGroup, GROUP_MEMBER_CAP, listGroupTokens, joinLounge, joinForum, sendForumMessage, pollLoungeInbox, parseLoungeDescriptor, loungeThreadToken, FORUM_DESC_VERSION, FORUM_DESC_VERSION_2, exportGroupRecords, type GroupMemberRow } from '../vendor/device/src/index';
-import { type VeilSettings, normalizeSettings, AUTO_LOCK_MINUTES, SELF_DESTRUCT_HOURS, SELF_DESTRUCT_WARN_HOURS } from '../vendor/device/src/settings';
+import { provisionIdentity, restoreFromPhrase, ensurePqPrekeySigned, runProtocolUpgrade, createOneTapSession, acceptOneTapSession, syncChat, sendChatMessage, sendCoverEnvelope, sendReadReceipt, sendReaction, completeContactHandshake, sendMediaMessage, loadMediaFile, markEnvelopeDisplayed, markEnvelopesDisplayed, MEDIA_LIMIT_BYTES,
+  createGroup, createGroupSeats, buildGroupInvitePayload, joinGroup, pollGroupInbox, confirmLegacyRoster, removeForumMember, sendGroupMessage, sendGroupReceipt, sendGroupMediaMessage, rotateGroup, evictGroupMember, groupRowLabel, loadGroupRecord, loadGroupRecords, saveGroupRecord, groupRecord, findMainGroupSession, forgetGroup, GROUP_MEMBER_CAP, listGroupTokens, joinLounge, joinForum, markForumGroupIfFounder, FORUM_PIN, sendForumMessage, pollLoungeInbox, parseLoungeDescriptor, loungeThreadToken, FORUM_DESC_VERSION, FORUM_DESC_VERSION_2, exportGroupRecords, type GroupMemberRow,
+  sendForumReport, buildRemoveText, loadBlockList, blockVeilId, unblockVeilId, withoutBlocked, isFromBlocked } from '../vendor/device/src/index';
+import { type VeilSettings, normalizeSettings, SettingsStore, AUTO_LOCK_MINUTES, SELF_DESTRUCT_HOURS, SELF_DESTRUCT_WARN_HOURS, SELF_DESTRUCT_DAYS } from '../vendor/device/src/settings';
 import type { KeyvaultIdentity, ChatMessage } from '../vendor/device/src/index';
-import { silentLogin } from '../vendor/device/src/silent-auth';
+import { silentLogin, provisionSilentAccount, rebindSilentAccount, isSilentAccountEmail, deriveSilentCredentials, canonicalPhrase, SilentAccountUnavailableError } from '../vendor/device/src/silent-auth';
 import {
   noteSessionStart, noteAppOpen, noteVeilIdCreated, noteEmailVerified,
   noteFirstSession, saveAttribution, flushPendingAttribution,
 } from '../vendor/device/src/funnel';
-import { identityFingerprint, toB64 } from '../vendor/crypto-core/src/index';
+import { identityFingerprint, toB64, fromB64 } from '../vendor/crypto-core/src/index';
+import { parseVeilAddLink } from './qr';
 import type { SessionRow } from './screens/SessionsScreen';
 import { collapseGroupRows } from './session-list';
-import type { ContactRow, LookupResult } from './screens/ContactsScreen';
+import type { ContactRow, LookupResult, GroupInviteResult, ContactChatChoice } from './screens/ContactsScreen';
+import { PERMISSION_DECLINED, BIOMETRIC, BIOMETRIC_SHORT, SECURE_CHIP } from './platformText';
 
 type Screen = 'boot' | 'login' | 'otp' | 'identity' | 'onboard' | 'main' | 'chat' | 'welcome';
 
@@ -134,6 +218,41 @@ function VeilApp() {
     if (!app) return;
     loadGroupRecords(app.storage).then((n) => { if (n > 0) console.log(`[veil-group] restored ${n} group record(s)`); }).catch(() => undefined);
   }, [app]);
+  // b54 (Batch A) / Batch C: protocol upgrade (now veil-ratchet-6). (1) Sign +
+  // republish the ML-KEM prekey (peers refuse an unsigned one); (2) one-time hard
+  // cut per protocol bump: end older 1:1 chats on the relay, retire pre-b54
+  // private-group member records. Retries on the next launch if the relay is unreachable.
+  const b54UpgradeRef = useRef(false);
+  useEffect(() => {
+    if (!app || !identity || b54UpgradeRef.current) return;
+    b54UpgradeRef.current = true;
+    (async () => {
+      try {
+        const signedId = await ensurePqPrekeySigned({ relay: app.relay, vault: app.vault }, identity);
+        if (signedId !== identity) { console.log('[veil-b54] PQ prekey signed and republished'); setIdentity(signedId); }
+      } catch (e) {
+        console.warn('[veil-b54] PQ prekey signature not published yet — retrying next launch:', String((e as Error)?.message ?? e));
+      }
+      try {
+        const sess = await app.auth.currentSession();
+        if (!sess) return;
+        const res = await runProtocolUpgrade({ relay: app.relay, sessions: app.sessions, storage: app.storage }, sess.user.id, identity.veilId);
+        if (!res.alreadyDone) console.log('[veil-b54] protocol upgrade done', res);
+      } catch (e) {
+        console.warn('[veil-b54] protocol upgrade incomplete — retrying next launch:', String((e as Error)?.message ?? e));
+      }
+      // Batch C (A1): on the forum founder's phone, the forum group stays open
+      // membership (registry-verified); every other group is creator-authorised
+      try {
+        const payload = await fetchLoungePayload();
+        if (payload?.lounge) {
+          await markForumGroupIfFounder({ relay: app.relay, storage: app.storage }, { descriptor: parseLoungeDescriptor(payload.lounge), identity: { veilId: identity.veilId, ikPubB64: identity.ikPubB64 } });
+        }
+      } catch (e) {
+        console.warn('[veil-forum] founder forum check skipped:', String((e as Error)?.message ?? e));
+      }
+    })();
+  }, [app, identity]);
   const [pendingMaterial, setPendingMaterial] = useState<VeilIdentityMaterial | null>(null);
   // b112: phrase awaiting a classic email sign-in (pre-b112 accounts) — the
   // restore resumes automatically the moment that sign-in succeeds
@@ -204,10 +323,14 @@ function VeilApp() {
   const hsFailClosedRef = useRef<Set<string>>(new Set());
   const HB_LIMITER_COOLDOWN_MS = 30000;
   const backgroundSyncAllSessionsRef = useRef<() => void>(() => {});
+  // b199 reactions: set after applyPeerReactions is defined (the sync paths are declared earlier)
+  const applyPeerReactionsRef = useRef<(token: string, list?: { target: string; emoji: string | null }[]) => Promise<void>>(async () => {});
   const [chatMessages, setChatMessages] = useState<(ChatMessage & { sender?: string; senderVerified?: boolean; systemNote?: string })[]>([]);
   // b62 groups: per-thread known-envelope guard (separate from chatKnown because
   // group processing must not race the 1:1 path's set semantics)
   const groupKnownRef = useRef<Set<string>>(new Set());
+  // b54: background group peeks notify each envelope once (peek re-reads rows)
+  const groupPeekNotifiedRef = useRef<Set<string>>(new Set());
   // session-token -> group-token map, filled at openChat/join time (survives a
   // stale sessionRows snapshot until the next refresh)
   const groupKnownTokensRef = useRef<Record<string, string>>({});
@@ -234,6 +357,31 @@ function VeilApp() {
   }, [app]);
 
   const [chatKnown, setChatKnown] = useState<Set<string>>(new Set());
+  // Play UGC (18 Oct 2026): device-local block list (Vardum IDs). Blocked
+  // senders' messages aren't shown and don't notify; nothing leaves the phone.
+  const [blockedIds, setBlockedIds] = useState<Set<string>>(new Set());
+  const blockedRef = useRef<Set<string>>(new Set());
+  blockedRef.current = blockedIds;
+  // Batch G (round-5 review R5-2-05): until the list has loaded, other people's
+  // group/forum posts are not shown and don't notify (an unread list used to mean "nobody blocked")
+  const [blockListLoaded, setBlockListLoaded] = useState(false);
+  const blockListLoadedRef = useRef(false);
+  blockListLoadedRef.current = blockListLoaded;
+  useEffect(() => {
+    if (!app) return;
+    // Batch E (N3-4): a failed read keeps the current list and retries (it used
+    // to be swallowed, leaving blocked senders visible)
+    let stop = false;
+    const loadBlockListRetry = (attempt: number) => {
+      loadBlockList(app.storage).then((s) => { if (!stop) { setBlockedIds(s); setBlockListLoaded(true); } }).catch((e) => {
+        console.log('[veil] block list unreadable (BlockListUnreadableError) — retrying', attempt, String((e as Error)?.message ?? e));
+        // Batch F (R4-2-05): keep trying (5 s, backing off to once a minute) — it used to stop after ~1 minute
+        if (!stop) setTimeout(() => loadBlockListRetry(attempt + 1), Math.min(60_000, 5_000 * attempt));
+      });
+    };
+    loadBlockListRetry(1);
+    return () => { stop = true; };
+  }, [app]);
   const [draft, setDraft] = useState('');
   // media: the picked-but-unsent image (confirm dialog), and the per-message
   // decrypt cache (data: URIs in MEMORY — web parity: decrypted blobs never
@@ -273,12 +421,12 @@ function VeilApp() {
       // once every row is tagged.
       const data = (await app.relay.entityList('VeilNote', { sort: '-updated_date', limit: 100 })) as unknown;
       const rows = (Array.isArray(data) ? data : ((data as { data?: unknown[] })?.data ?? [])) as Array<{
-        id: string; owner_veil_id?: string; payload_ciphertext?: string; payload_iv?: string;
+        id: string; owner_veil_id?: string; payload_ciphertext?: string; payload_iv?: string; note_nid?: string; note_v?: number;
       }>;
       for (const r of rows) {
         if (!r.id || r.owner_veil_id || !r.payload_ciphertext || !r.payload_iv) continue;
         try {
-          await app.notes.decryptNote(r.payload_ciphertext, r.payload_iv); // proof of ownership
+          await app.notes.decryptNote(r.payload_ciphertext, r.payload_iv, noteMetaOf(r)); // proof of ownership
           await app.relay.entityUpdate('VeilNote', r.id, { owner_veil_id: id.veilId });
         } catch { /* not this identity's key — leave untagged */ }
       }
@@ -331,7 +479,10 @@ function VeilApp() {
     // usable: the login session, the mode flag, the privacy dials, the
     // app-lock gate, pinned contacts, and the device's client id. Notes key,
     // vault keys, message caches, ratchet states, identity — all gone.
-    const keep = new Set(['veil_auth_session', 'veil_storage_mode', 'veil_settings_v1', 'veil_app_lock', 'veil_pins_v1', 'veil_client_id']);
+    // Batch H (round-6 review R6-1-01, a Batch G regression): read the push target
+    // BEFORE the loop below deletes the cached token it is stored under
+    const pushTarget = await capturePushTargetOf(app);
+    const keep = new Set(['veil_auth_session', 'veil_storage_mode', 'veil_settings_v1', 'veil_app_lock', 'veil_pins_v1', 'veil_client_id', 'veil_push_device_v1']);
     for (const k of await app.storage.keys('veil_')) {
       if (keep.has(k)) continue;
       await secureRemove(app.storage, k).catch(() => undefined);
@@ -342,15 +493,8 @@ function VeilApp() {
     // notified after a NaR lock). Re-registers only when an identity is
     // restored from the phrase (the App registration effect gates on identity).
     // best-effort at every wipe site; offline flip retries at the boot wipe
-    try {
-      await unregisterPushToken({
-        entityCreate: (e, r) => app.relay.entityCreate(e, r),
-        entityList: (e, pr) => app.relay.entityList(e, pr),
-        entityDelete: (e, id) => app.relay.entityDelete(e, id),
-        getCached: (k) => app.storage.get(k),
-        setCached: (k, v) => app.storage.set(k, v),
-      });
-    } catch { /* never block a wipe on the network */ }
+    await shredHardwareKey(); // Batch H (R6-1-02)
+    await dropPushRegistration(app, pushTarget);
   }, [app]);
   const naRWipeRef = useRef(naRWipeStorage);
   useEffect(() => { naRWipeRef.current = naRWipeStorage; }, [naRWipeStorage]);
@@ -407,7 +551,7 @@ function VeilApp() {
           // passcode fallback — the SE key's ACL has none either).
           if (s.storageMode === 'hardware') {
             const bio = await LocalAuthentication.authenticateAsync({
-              promptMessage: 'Confirm Face ID to switch key storage to hardware',
+              promptMessage: `Confirm ${BIOMETRIC} to switch key storage to hardware`,
               cancelLabel: 'Cancel',
               disableDeviceFallback: true,
             });
@@ -435,7 +579,7 @@ function VeilApp() {
           // in place and the next boot demands it again.
           if (s.storageMode === 'hardware' && id) {
             if (secureEnclaveAvailable() && (await keyvaultEntrySealed()) === 'plain') {
-              throw new Error('Secure Enclave did not accept the seal');
+              throw new Error(`${SECURE_CHIP} did not accept the seal`);
             }
             // b104: stop swallowing this read — its failure was invisible
             // ("absolutely nothing" on b103). A failure here after a
@@ -476,7 +620,7 @@ function VeilApp() {
           Alert.alert(
             'Could not switch key storage mode',
             authIssue
-              ? 'Face ID / passcode confirmation failed or was cancelled. Reverted — try again and complete the prompt when it appears.'
+              ? `${BIOMETRIC_SHORT} / passcode confirmation failed or was cancelled. Reverted — try again and complete the prompt when it appears.`
               : 'Reverted — try again.',
           );
         }
@@ -531,6 +675,19 @@ function VeilApp() {
   // b155 decision A: relay record's contact_session flag per token —
   // contact (pinned) threads show 'Pinned contact', never ceremony state.
   const sessionContactRef = useRef<Record<string, boolean>>({});
+  /** Batch E (N3-1): both sides confirmed the safety code, per 1:1 session (from the list) */
+  const sessionVerifiedRef = useRef<Record<string, boolean>>({});
+  /** Batch G (R5-1-05): chats whose contact key changed since the pin — stay unverified */
+  const revokedTokensRef = useRef<Set<string>>(new Set());
+  /** Batch G (R5-3-06): chats whose relay "verified" flag was re-sent this run */
+  const verifyResentRef = useRef<Set<string>>(new Set());
+  /** Batch G (round-5 review R5-1-08): call offers and answers only on a chat whose
+   *  safety codes both sides confirmed (starting a call was already gated) */
+  const callSignalsAllowed = (token: string): boolean => {
+    const ok = !!sessionVerifiedRef.current[token];
+    if (!ok) console.log(`[veil-call] #${token.slice(0, 4)}: call signals ignored — safety codes not confirmed`);
+    return ok;
+  };
   // b155: live view of session rows for the presence heartbeat loop
   const hbRowsRef = useRef<SessionRow[]>([]);
 
@@ -550,6 +707,9 @@ function VeilApp() {
   const backgrounded = useRef(false);
   const autoLockBgAtRef = useRef<number | null>(null);
   const settingsRef = useRef<VeilSettings>(DEFAULTS);
+  /** true only while Settings → "Generate new Vardum ID" runs the create flow:
+   *  that path returns an existing user straight to the app (no onboarding) */
+  const regeneratingIdRef = useRef(false);
   const [sessionRows, setSessionRows] = useState<SessionRow[]>([]);
   /** b178: session tokens seen by the LAST refreshSessions pass — null until
    *  the first pass seeds it (silent seed, no invite banners on login). */
@@ -640,19 +800,40 @@ function VeilApp() {
       // on close): the iOS Keychain can refuse large cache writes — surface
       // it in the open thread instead of failing invisibly.
       a.sessions.onCacheWriteFailure = (token) => setCacheSaveFailed(token);
-      setApp(a);
       // b170: MUST run before anything below reads the Keychain-stored auth
       // session or identity — a reinstall-with-leftover-Keychain-data sweep
       // happening after that point would be too late (see fresh-install-guard.ts).
       await purgeIfFreshInstall(a).catch((e) => console.error('[veil-fresh-install] guard threw (non-fatal):', String((e as Error)?.message || e)));
+      // b199 (owner hardware finding, Oct 16): setApp used to run BEFORE the
+      // sweep above, so every [app] effect raced it — the group-record loader
+      // read the previous install's group into memory mid-sweep and polled it
+      // with dead credentials (403 "Invalid session credential" every few
+      // seconds until the next restart). The app is published to React only
+      // once the Keychain is known-clean.
+      setApp(a);
       // b104: capture the REAL persisted settings in a local and sync the ref
       // NOW — the dead-entry catch below must act on the actual storageMode,
       // and settingsRef would otherwise still hold DEFAULTS at that point
       // (the [settings] effect hasn't fired yet mid-boot).
       const bootSettings = await a.settings.load();
+      // b199: a fresh install (no saved settings yet) persists the defaults
+      // at once — so the history-OFF default is what the message store's
+      // write gate actually sees from the very first message. Installs that
+      // already saved settings keep their own choice untouched.
+      if ((await a.storage.get(SettingsStore.KEY)) == null) {
+        await a.settings.save(bootSettings).catch((e) => console.error('[veil] default settings save failed:', e));
+      }
       settingsRef.current = bootSettings;
       setSettings(bootSettings);
-      const lockRec = await a.appLock.load();
+      // Batch D (D-11): an unreadable lock record means LOCKED, never "no lock" —
+      // the lock screen shows, and verify reports the read error until it clears
+      let lockRec: AppLockRecord | null;
+      try {
+        lockRec = await a.appLock.load();
+      } catch (e) {
+        console.error('[veil-lock] lock record unreadable — staying locked', String((e as Error)?.message ?? e));
+        lockRec = { method: 'passcode', kdf: '', salt: '', realHash: '', decoyHash: null, duressHash: null } as AppLockRecord;
+      }
       setAppLock(lockRec);
       setLockout(await a.appLock.lockout()); // b123: a surviving lockout window carries across restarts
       const session = await a.auth.currentSession();
@@ -683,7 +864,16 @@ function VeilApp() {
       try {
         if (await a.vault.mode() === 'memory') await naRWipeRef.current?.();
       } catch { /* mode unreadable → normal boot */ }
-      if (session) {
+      // Batch H (round-6 review R6-1-08): the cold-boot self-destruct runs from the
+      // boot settings BEFORE the identity is read. In hardware mode that read is
+      // Face ID: a seizer who cancels it used to skip the wipe entirely.
+      const selfDestructed = selfDestructDue(bootSettings);
+      if (selfDestructed) {
+        await selfDestructWipe(a);
+        setAppLock(null); setIdentity(null); setSettings(DEFAULTS);
+        knownSessionTokensRef.current = null; setSessionRows([]); /* b178 re-seed */ setContactRows([]); setLocked(false); setScreen('identity');
+      }
+      if (session && !selfDestructed) {
         let id: KeyvaultIdentity | null = null;
         try {
           id = await a.vault.load();
@@ -736,17 +926,19 @@ function VeilApp() {
                 await resetSecureEnclaveKey();
                 await a.vault.save(id);
               }
-            } catch { /* best-effort */ }
+            } catch (e) {
+              // Batch F (round-4 review R4-4-19): say so — Settings would otherwise
+              // read "hardware" while the key entry stays unsealed
+              console.log('[veil] boot re-seal failed:', String((e as Error)?.message ?? e));
+              Alert.alert('Hardware key protection is off', 'Vardum could not turn hardware key protection back on for this phone. Open Settings → Key storage and choose it again.');
+            }
           }
           // b92 F-S3 (settings sweep): the 48h self-destruct clock was only
           // enforced on background→foreground transitions — a COLD START
           // (the exact seizure scenario the feature exists for) skipped the
           // check. Run the identical rule here, before anything renders.
-          if (st.selfDestruct && st.selfDestructArmedAt && Date.now() - st.selfDestructArmedAt >= SELF_DESTRUCT_HOURS * 3600000) {
-            for (const k of await a.storage.keys('veil_')) {
-              if (k === 'veil_auth_session') continue;
-              await secureRemove(a.storage, k).catch(() => undefined);
-            }
+          if (selfDestructDue(st)) {
+            await selfDestructWipe(a); // Batch H: one wipe, push dropped after it
             setAppLock(null); setIdentity(null); setSettings(DEFAULTS);
             knownSessionTokensRef.current = null; setSessionRows([]); /* b178 re-seed */ setContactRows([]); setLocked(false); setScreen('identity');
           } else if (st.selfDestruct && st.selfDestructArmedAt
@@ -757,13 +949,16 @@ function VeilApp() {
             const left = Math.max(0, SELF_DESTRUCT_HOURS - Math.floor((Date.now() - st.selfDestructArmedAt) / 3600000));
             Alert.alert(
               'Self-destruct countdown',
-              `Your self-destruct clock has ${left} hour${left === 1 ? '' : 's'} left. Messaging never resets it. Extend it by another ${SELF_DESTRUCT_HOURS} hours from Settings → Privacy, or let it wipe this device's VEIL data when it reaches zero.`,
+              `Your self-destruct clock has ${left} hour${left === 1 ? '' : 's'} left. Messaging never resets it. Extend it by another ${SELF_DESTRUCT_DAYS} days from Settings → Lock and emergency, or let it wipe this device's Vardum data when it reaches zero.`,
             );
           }
           setSettings(st);
-          // handoff §1(4): fresh/returning users go straight into the app;
-          // the checkup + app lock wait behind the dismissible "Secure your VEIL" prompt
-          setScreen('main');
+          // handoff §1(4): returning users go straight into the app; the
+          // checkup + app lock wait behind the dismissible "Secure your VEIL"
+          // prompt. b199: a NEW sign-up that closed the app mid-onboarding
+          // resumes the required onboarding instead (from the first slide).
+          if (st.onboardingPending) { setOnboardingMode('full'); setScreen('onboard'); }
+          else setScreen('main');
           // b139 funnel fix: the "Secure your VEIL" prompt waits until after
           // the user's first real session — never before.
           setSecurePrompt(!st.setupDone && st.firstSessionDone);
@@ -783,6 +978,7 @@ function VeilApp() {
       // [settings.screenshotShield, bgState] near the top of the component —
       // driven by state, awaited, and logged to Metro instead of the old
       // fire-and-forget ref callback that failed silently on device.
+      let sheetAwayAt = 0; // b199: when Vardum went to the background for its own picker/prompt
       const sub = AppState.addEventListener('change', async (s) => {
         try {
           // b95 NaR v2 (owner hardware verify: locking the phone fired NOTHING
@@ -790,12 +986,24 @@ function VeilApp() {
           // ANY departure from the foreground wipes the full Veil surface —
           // chats, notes, vaults, stego, identity. RAM resets too, so on unlock
           // the user lands on the identity screen (24-word phrase restores it).
-          if ((s === 'inactive' || s === 'background') && settingsRef.current.storageMode === 'memory') {
+          // b199 (ZTE device run): a picker/prompt Vardum itself opened is not a
+          // departure — Android runs those as separate screens. Only while one
+          // is open (withSystemSheet); any other exit still locks/wipes at once.
+          const sheetOpen = s !== 'active' && systemSheetExpected();
+          if (sheetOpen) console.log(`[veil-lock] ${s} while a system picker/prompt is open — not locking`);
+          if (sheetOpen && s === 'background') sheetAwayAt = Date.now();
+          if (s === 'active' && sheetAwayAt) {
+            // a picker left open for over 2 min (Home pressed from inside it,
+            // phone set down) is treated as a real departure after all
+            const away = Date.now() - sheetAwayAt; sheetAwayAt = 0;
+            if (away > 120_000 && (identityRef.current || appLockRef.current) && !lockedRef.current) { console.log(`[veil-lock] picker open ${Math.round(away / 1000)}s — locking`); setLocked(true); }
+          }
+          if (!sheetOpen && (s === 'inactive' || s === 'background') && settingsRef.current.storageMode === 'memory') {
             await naRWipeRef.current?.().catch(() => undefined);
             setIdentity(null); setChat(null); knownSessionTokensRef.current = null; setSessionRows([]); /* b178 re-seed */ setContactRows([]);
             setDecoyMode(false); setScreen('identity');
           }
-          if (s === 'background') {
+          if (s === 'background' && !sheetOpen) {
             backgrounded.current = true;
             setBackgrounded(true); // (b64) drives the capture-shield effect (app-switcher redaction)
             autoLockBgAtRef.current = Date.now();
@@ -817,13 +1025,10 @@ function VeilApp() {
             // new threads, presence all feel immediate on return).
             refreshSessionsRef.current?.();
             refreshContactsRef.current?.();
-            // self-destruct countdown: fixed 48h clock, messaging never resets it
+            // self-destruct countdown: fixed 14-day clock (b199; was 48h), messaging never resets it
             const st = settingsRef.current;
-            if (st.selfDestruct && st.selfDestructArmedAt && Date.now() - st.selfDestructArmedAt >= SELF_DESTRUCT_HOURS * 3600000) {
-              for (const k of await a.storage.keys('veil_')) {
-                if (k === 'veil_auth_session') continue;
-                await a.storage.remove(k).catch(() => undefined);
-              }
+            if (selfDestructDue(st)) {
+              await selfDestructWipe(a); // Batch H: one wipe, push dropped after it
               setAppLock(null); setIdentity(null); setSettings(DEFAULTS);
               knownSessionTokensRef.current = null; setSessionRows([]); /* b178 re-seed */ setContactRows([]); setLocked(false); setScreen('identity');
             }
@@ -982,109 +1187,78 @@ function VeilApp() {
       return;
     }
     const t0 = Date.now();
-    console.log(`[veil-lock] unlock attempt (${code.length} digits)`);
+    console.log("[veil-lock] unlock attempt"); // b199: no length — it is a password now
     setCodeVerifying(true); setCodeError(null);
     try {
-    const kind = await app.appLock.verify(code);
+    let kind: Awaited<ReturnType<typeof app.appLock.verify>>;
+    try {
+      kind = await app.appLock.verify(code);
+    } catch (e) {
+      // Batch D (D-11): verify refuses during a lockout, and an unreadable lock
+      // record stays locked; both say so instead of failing silently
+      setLockout(await app.appLock.lockout().catch(() => null));
+      setCodeError(String((e as Error)?.message ?? 'Could not check the password. Try again.'));
+      setCodeResetKey(Date.now());
+      return;
+    }
     console.log(`[veil-lock] verify complete: ${kind ?? 'WRONG'} in ${Date.now() - t0} ms`);
     if (kind === 'real') {
       await app.appLock.clearLockout(); setLockout(null); // b123: fresh 5-attempt budget on a good unlock
       setCodeError(null); setDecoyMode(false); setLocked(false); veilActivityPing();
     } else if (kind === 'decoy') {
-      // Decoy: harmless empty environment — real data untouched, real code still unlocks
-      await app.appLock.clearLockout(); setLockout(null); // b123: a correct code resets the budget — attacker-safe (they still only see decoy data)
+      // Decoy: harmless empty environment — real data untouched, real code still unlocks.
+      // Batch C (V-23): the decoy code does NOT reset the wrong-attempt budget —
+      // someone who knows (or was given) the decoy code could otherwise keep
+      // guessing the real one forever. Only the real code resets it.
+      setLockout(null);
       setCodeError(null); setDecoyMode(true); setLocked(false); setTab('sessions'); veilActivityPing();
     } else if (kind === 'duress') {
-      // Duress: NOTHING survives. Server-side first (threads, vaults, notes),
-      // then local veil_* storage, then app-saved Photos artifacts and the
-      // encrypted-container file cache. Account login itself is the only
-      // thing left standing afterwards.
-      // (b64) 1. bulk gate purge — service-role delete of every session +
-      // envelope this client participates in, incl. peer-created rows the
-      // user-scoped entity API cannot touch under RLS.
-      try {
-        const sess = await app.auth.currentSession();
-        if (sess) { await app.relay.sessionPurge(sess.user.id); }
-      } catch { /* gate action not deployed yet — per-thread fallback below */ }
-      // 2. per-thread end + record delete (still needed until the purge
-      // action ships server-side, and as a belt-and-braces pass afterwards)
-      try {
-        const sess = await app.auth.currentSession();
-        if (sess) {
-          const r = await app.relay.sessionList(sess.user.id, undefined);
-          const list = (r.data as { data?: unknown[] })?.data ?? (r.data as unknown as { sessions?: unknown[] })?.sessions ?? (r.data as unknown[]);
-          for (const raw of Array.isArray(list) ? list : []) {
-            const rec = raw as Record<string, unknown>;
-            const tok = String(rec.token ?? '');
-            const rid = String(rec.id ?? '');
-            if (!tok) continue;
-            let ws: string | null = null;
-            try { ws = (await app.sessions.load(tok))?.writeSecret ?? null; } catch { /* no sealed record */ }
-            try { await app.relay.sessionEnd(tok, ws, sess.user.id); } catch { /* peer-created or pending: end best-effort */ }
-            if (rid) { try { await app.relay.entityDelete('VeilSession', rid); } catch { /* RLS: best-effort */ } }
-          }
-        }
-      } catch { /* server-side wipe best-effort; local wipe below always runs */ }
-      // (b64) 3. vaults + notes: OUR relay records (created_by = this
-      // account) — delete via the entity API so nothing is left to list
-      // after re-login. Loop until the list comes back empty; stop early if
-      // nothing was deletable (RLS denial) to avoid spinning.
-      try {
-        for (const ent of ['VeilVault', 'VeilNote'] as const) {
-          for (let guard = 0; guard < 50; guard++) {
-            const raw: unknown = await app.relay.entityList(ent, { limit: 100, sort: '-created_date' });
-            const rec = raw as { data?: unknown };
-            const rows = (Array.isArray(rec?.data) ? rec.data : (Array.isArray(raw) ? raw : [])) as { id?: string }[];
-            if (!rows.length) break;
-            let removed = 0;
-            for (const r of rows) {
-              const id = String(r?.id ?? '');
-              if (!id) continue;
-              try { await app.relay.entityDelete(ent, id); removed++; } catch { /* RLS-denied */ }
-            }
-            if (removed === 0) break;
-          }
-        }
-      } catch { /* server-side best-effort; local wipe below always runs */ }
-      // (b64) 4. stego images this app saved to Photos — tracked in
-      // veil_saved_media at save time; delete silently, no permission
-      // prompts (a dialog under duress would tip off the attacker).
-      try {
-        const rawIds = await app.storage.get('veil_saved_media');
-        const ids = rawIds ? (JSON.parse(rawIds) as string[]) : [];
-        if (ids.length) {
-          const perm = await MediaLibrary.getPermissionsAsync();
-          if (perm.granted) { try { await MediaLibrary.deleteAssetsAsync(ids); } catch { /* best-effort */ } }
-        }
-      } catch { /* best-effort */ }
-      // (b64) 5. encrypted vault-container file cache (ciphertext, but the
-      // duress claim is that NOTHING survives) + stray temp files.
-      try {
-        const cacheDir = FileSystem.cacheDirectory;
-        if (cacheDir) {
+      // Duress: NOTHING survives except the account login. Batch I (local
+      // security review V-01): the phone is erased FIRST (every veil_* key,
+      // the hardware wrap key, the vault/stego file cache); the server cleanup
+      // (purge, per-thread end, vaults, notes, Photos, push) runs afterwards
+      // in the background, bounded, from values read before the wipe. A
+      // stalled relay can no longer hold the local erase back.
+      const { leftAfterWipe } = await runDuressWipe({
+        storage: app.storage,
+        relay: app.relay,
+        userId: async () => (await app.auth.currentSession())?.user?.id ?? null,
+        localTokens: () => app.sessions.listTokens(),
+        writeSecretOf: async (t) => (await app.sessions.load(t))?.writeSecret ?? null,
+        capturePushTarget: () => capturePushTargetOf(app),
+        shredHardwareKey, // Batch H (R6-1-02): no prompt; the wrapped identity can never be opened again
+        clearFileCache: async () => {
+          // (b64) 5. encrypted vault-container file cache + stray temp files
+          const cacheDir = FileSystem.cacheDirectory;
+          if (!cacheDir) return;
           for (const f of await FileSystem.readDirectoryAsync(cacheDir)) {
             if (f.startsWith('veil-vault-') || f.startsWith('veil-stego-') || f.startsWith('veil-upload-')) {
               await FileSystem.deleteAsync(cacheDir + f, { idempotent: true }).catch(() => undefined);
             }
           }
-        }
-      } catch { /* best-effort */ }
-      for (const k of await app.storage.keys('veil_')) {
-        if (k === 'veil_auth_session') continue; // account login survives; everything Veil-stored goes
-        await secureRemove(app.storage, k).catch(() => undefined);
-      }
+        },
+        deleteSavedMedia: async (ids) => {
+          // (b64) 4. stego images this app saved to Photos; never asks for permission
+          const perm = await MediaLibrary.getPermissionsAsync();
+          if (perm.granted) await MediaLibrary.deleteAssetsAsync(ids);
+        },
+        dropPushRegistration: (target) => dropPushRegistration(app, target), // Batch F (R4-4-17)
+      });
+      if (leftAfterWipe > 0) console.log(`[veil] wipe verify: ${leftAfterWipe} item(s) could not be removed`);
+      else if (leftAfterWipe < 0) console.log('[veil] wipe verify: unknown — the stored keys could not be listed'); // Batch I (V-04)
       setAppLock(null); setIdentity(null); setSettings(DEFAULTS);
       knownSessionTokensRef.current = null; setSessionRows([]); /* b178 re-seed */ setContactRows([]); setDecoyMode(false);
       setLocked(false); setScreen('identity');
     } else {
-      // b123: count the miss — 5 wrong attempts arm the progressive lockout
-      const st = await app.appLock.recordFail();
+      // b123: 5 wrong attempts arm the progressive lockout. Batch D (D-11):
+      // verify already counted this miss; read the state back
+      const st = await app.appLock.lockout();
       setLockout(st);
       if (st.lockedUntil > Date.now()) {
         setCodeError(`Too many incorrect attempts — locked out. Try again later.`);
       } else {
         const left = MAX_ATTEMPTS - st.fails;
-        setCodeError(left > 1 ? `Incorrect passcode. ${left} attempts remaining.` : left === 1 ? 'Incorrect passcode. 1 attempt remaining.' : 'Incorrect passcode.');
+        setCodeError(left > 1 ? `Incorrect password. ${left} attempts remaining.` : left === 1 ? 'Incorrect password. 1 attempt remaining.' : 'Incorrect password.');
       }
       setCodeResetKey(Date.now());
     }
@@ -1122,22 +1296,67 @@ function VeilApp() {
     // fallback before). Native therefore no longer fires a guaranteed-404
     // custom-function call on every fresh install; it goes straight to
     // sign-in, and the identity finishes automatically right after.
-    if (!(await app.auth.currentSession())) {
-      setInfo('One extra step: sign in with (or create) your VEIL account. Your new identity finishes automatically right after.');
-      setScreen('login');
-      return;
+    // b199: the self-hosted relay DOES provision phrase-derived accounts
+    // (veilSilentAccount), so a fresh install signs in with the 24 words
+    // alone — no email, no password, nothing personal. Only a relay without
+    // that function falls back to the classic sign-in step.
+    const phrase = pendingMaterial.mnemonic.join(' ');
+    const priorSession = await app.auth.currentSession();
+    if (!priorSession) {
+      try {
+        const s = await provisionSilentAccount({ auth: app.auth, relay: app.relay }, phrase);
+        setEmail(String(s.user?.email ?? ''));
+      } catch (e) {
+        if (!(e instanceof SilentAccountUnavailableError)) { setError(friendlyError(e, 'identity')); return; }
+        setInfo('One extra step: sign in with (or create) your Vardum account. Your new identity finishes automatically right after.');
+        setScreen('login');
+        return;
+      }
     }
     const id = await provisionIdentity({ relay: app.relay, vault: app.vault }, pendingMaterial);
+    // b199: "Generate new Veil ID" on a 24-word account — the sign-in follows
+    // the NEW phrase (the old one is retired with the old identity), so a
+    // later restore with the new 24 words still finds this account.
+    if (priorSession && isSilentAccountEmail(priorSession.user?.email)) {
+      try {
+        await rebindSilentAccount({ auth: app.auth, relay: app.relay }, phrase);
+        setEmail((await deriveSilentCredentials(phrase)).email);
+      } catch (e) {
+        console.log('[veil-error] rebind after regenerate:', String((e as Error)?.message ?? e));
+        Alert.alert(
+          'Sign-in not moved to your new words',
+          'Your new Vardum ID is ready, but this account still signs in with your PREVIOUS 24 words. Keep them until you can retry from Settings → Account → "Sign in with my 24 words".',
+        );
+      }
+    }
     setIdentity(id); setPendingMaterial(null); setIdentityEntry('choose');
     await ensureNotesKey(id);
-    // b171: funnel is pick a Veil ID, then (per b171 above) the permanent
-    // email account step on a fresh install, then land in the app. The
-    // privacy checkup + passcode wait
-    // behind the dismissible "Secure your VEIL" prompt after the first
-    // session; the intro slides stay reachable from Settings.
+    try { await noteVeilIdCreated(app.relay, app.storage); } catch { /* never a blocker */ }
+    // b199 ONBOARDING ORDER (owner decision, Oct 16 2026 — replaces the b139
+    // "land in the app, checkup later" funnel for NEW sign-ups): phrase →
+    // intro slides → privacy checkup → Veil ID + passcode → app. Required,
+    // no skip. The pending flag is persisted FIRST so closing the app midway
+    // resumes the onboarding at the next launch instead of opening the app.
+    // Owner report (Oct 18): the onboarding was skipped whenever the phone was
+    // still signed in (after "Remove identity", or a reinstall that kept the
+    // sign-in). Every new ID made from the start screen now gets it; only
+    // Settings → "Generate new Vardum ID" returns straight to the app.
+    // Phrase restores never come through here.
+    const regenerating = regeneratingIdRef.current;
+    regeneratingIdRef.current = false;
+    if (!regenerating) {
+      const st0 = await app.settings.load();
+      const st1 = { ...st0, onboardingPending: true };
+      await app.settings.save(st1).catch((e) => console.error('[veil] onboarding flag save failed:', e));
+      setSettings(st1);
+      settingsRef.current = st1;
+      setSecurePrompt(false);
+      setOnboardingMode('full');
+      setScreen('onboard');
+      return;
+    }
     setScreen('main');
     setSecurePrompt(false);
-    try { await noteVeilIdCreated(app.relay, app.storage); } catch { /* never a blocker */ }
     try { if (!(await app.settings.load()).attributionDone) setShowAttribution(true); } catch { /* best-effort */ }
   }, [app, pendingMaterial]);
 
@@ -1153,12 +1372,26 @@ function VeilApp() {
     }
   }, [app, identity]);
 
+  /** b199 Settings > Account "Sign in with my 24 words": a made-up-email
+   *  account moves its sign-in to the phrase. The phrase is checked against
+   *  THIS identity on-device first; only the derived label + password reach
+   *  the relay. The old email + password stop working. */
+  const handleSwitchToPhraseSignIn = useCallback(async (phrase: string): Promise<'ok' | 'wrong-phrase'> => {
+    if (!app || !identity) return 'wrong-phrase';
+    const norm = canonicalPhrase(phrase);
+    try { await restoreIdentity(norm, identity.veilId, false); } catch { return 'wrong-phrase'; }
+    await rebindSilentAccount({ auth: app.auth, relay: app.relay }, norm);
+    setEmail((await deriveSilentCredentials(norm)).email);
+    return 'ok';
+  }, [app, identity]);
+
   /** Settings > Identity (web parity "Remove from this device"): drop this device's keyvault copy only.
    *  Sessions, pins and settings are untouched — the identity stays recoverable with its phrase. */
   const handleRemoveIdentity = useCallback(async () => {
     if (!app) return;
     await app.vault.clear();
     setIdentity(null);
+    regeneratingIdRef.current = false;
   }, [app]);
 
   /** "Generate new Veil ID" (landing headline feature): the old identity's keyvault copy is
@@ -1168,29 +1401,39 @@ function VeilApp() {
     if (!app) return;
     await app.vault.clear();
     setIdentity(null);
+    regeneratingIdRef.current = true;
     setIdentityEntry('confirm-create');
     setScreen('identity');
   }, [app]);
 
   /** Settings > Identity when no identity is on this device — open the create/restore flow */
   const handleOpenIdentityFlow = useCallback(() => {
+    regeneratingIdRef.current = false;
     setIdentityEntry('choose');
     setScreen('identity');
   }, []);
 
-  const handleRestore = useCallback(async (phrase: string) => {
+  const handleRestore = useCallback(async (rawPhrase: string) => {
     if (!app) return;
+    // b199: one canonical phrase for every step (sign-in derivation, identity
+    // re-derivation, the pending-restore resume) — IdentityScreen already
+    // validated it; this keeps any other caller on the same form.
+    const phrase = canonicalPhrase(rawPhrase);
     // b112: the phrase now recovers the ACCOUNT too. No session on this
     // device → sign in with the phrase-derived credentials first.
     if (!(await app.auth.currentSession())) {
       try {
-        await silentLogin({ auth: app.auth, relay: app.relay }, phrase);
+        const s = await silentLogin({ auth: app.auth, relay: app.relay }, phrase);
+        setEmail(String(s.user?.email ?? ''));
       } catch (e) {
         if (isCredentialFailure(String((e as Error).message ?? e))) {
           // pre-b112 email account — classic sign-in, then the restore
           // resumes automatically (resumeIdentityFlow)
           setPendingRestorePhrase(phrase);
-          setInfo('Sign in with your existing VEIL account — your identity restores right after.');
+          // b199: say WHY this screen appeared — the words are valid (checked
+          // on-device), but no 24-word account exists for them on the relay
+          console.log('[veil-restore] valid phrase, no 24-word account on the relay — offering the email sign-in');
+          setInfo('Your 24 words are valid, but no account signs in with them yet. If this identity was set up with an email address, sign in with it below and your identity restores right after.');
           setScreen('login');
           return;
         }
@@ -1287,7 +1530,7 @@ function VeilApp() {
   }, [app, identity, forumJoining, handleJoinLounge]);
 
   const handleJoinInvite = useCallback(async (link: string) => {
-    if (!app || !identity) throw new Error('Create your Veil identity first — Settings → Identity.');
+    if (!app || !identity) throw new Error('Create your Vardum identity first — Settings → Identity.');
     const who = await clientId();
     if (!who) throw new Error('Sign in first.');
     if (/[?&]g=/.test(link)) {
@@ -1305,7 +1548,11 @@ function VeilApp() {
         { link, clientId: who, displayName: settings.nickname || '' },
       );
     }
-    await refreshSessions();
+    // b199 (owner hardware test Oct 16: "Joined" then a long wait before the
+    // group showed): opening the invite card unlocks burns, and pending burns
+    // hold ambient relay traffic — which silently skipped this refresh. A join
+    // the user just tapped is not ambient: force it so the row appears now.
+    await refreshSessions(true);
   }, [app, identity, settings.nickname]);
 
   /**
@@ -1317,38 +1564,121 @@ function VeilApp() {
    * user is signed in and unlocked. Survives lock: consumed when unlocked.
    */
   const pendingInviteRef = useRef<string | null>(null);
+  // Batch G (round-5 review R5-3-07 / R4-3-10): bumped when a link arrives, so the
+  // confirmation below runs at once even while the app is already unlocked
+  const [inviteTick, setInviteTick] = useState(0);
   const normalizeInviteUrl = useCallback((raw: string): string | null => {
     if (!raw) return null;
     const full = raw.match(/https:\/\/tryveil\.app\/\?[^\s"']*/);
     if (full) return full[0];
     const jm = raw.match(/[?&]join=([A-Za-z0-9]+)/);
     if (!jm) return null;
-    const wm = raw.match(/#w=([A-Za-z0-9]+)/);
-    return 'https://tryveil.app/?join=' + jm[1] + (wm ? '#w=' + wm[1] : '');
+    // b54: keep the WHOLE fragment — it carries w= plus the link secret k=
+    // (and g=/e=/c= for groups); dropping any of it makes the join fail.
+    const frag = raw.match(/#(w=[^\s"']+)/);
+    return 'https://tryveil.app/?join=' + jm[1] + (frag ? '#' + frag[1] : '');
   }, []);
 
+  // b199 Veil QR: add links (https://tryveil.app/?add=<Veil ID>) are checked
+  // FIRST — normalizeInviteUrl accepts any tryveil.app/?… link and would feed
+  // an add link into the invite-join path. State (not a ref) so a link opened
+  // while the app is already unlocked acts at once.
+  const [pendingAdd, setPendingAdd] = useState<string | null>(null);
+  const [prefillAdd, setPrefillAdd] = useState<{ veilId: string; nonce: number } | null>(null);
   useEffect(() => {
+    // Batch G (R5-3-07): subscribe here (not inside the async block) so the effect's
+    // cleanup really removes the listener
+    const sub = Linking.addEventListener('url', ({ url }) => {
+      const add = parseVeilAddLink(url);
+      if (add) { setPendingAdd(add); return; }
+      const n = normalizeInviteUrl(url);
+      if (n) { pendingInviteRef.current = n; setInviteTick((t) => t + 1); }
+    });
     (async () => {
       try {
         const init = await Linking.getInitialURL();
-        const n = init ? normalizeInviteUrl(init) : null;
-        if (n) pendingInviteRef.current = n;
+        const add = init ? parseVeilAddLink(init) : null;
+        const n = init && !add ? normalizeInviteUrl(init) : null;
+        if (add) setPendingAdd(add);
+        else if (n) { pendingInviteRef.current = n; setInviteTick((t) => t + 1); }
       } catch { /* best-effort */ }
-      const sub = Linking.addEventListener('url', ({ url }) => {
-        const n = normalizeInviteUrl(url);
-        if (n) pendingInviteRef.current = n;
-      });
-      return () => sub.remove();
     })();
+    return () => { sub.remove(); };
   }, [normalizeInviteUrl]);
+
+  useEffect(() => {
+    if (!pendingAdd || !app || !identity || locked) return;
+    if (screen !== 'main' && screen !== 'chat') return; // never skip onboarding / setup — waits until the app proper
+    const id = pendingAdd;
+    setPendingAdd(null);
+    if (id === identity.veilId) { Alert.alert('That’s your own QR', 'Send it to someone else so they can add you.'); return; }
+    setScreen('main');
+    setTab('contacts');
+    setPrefillAdd({ veilId: id, nonce: Date.now() });
+  }, [pendingAdd, app, identity, locked, screen]);
 
   useEffect(() => {
     const link = pendingInviteRef.current;
     if (!link || !app || !identity || locked) return;
+    if (screen !== 'main' && screen !== 'chat') return; // never pops over onboarding / setup
     pendingInviteRef.current = null;
-    handleJoinInvite(link).catch((e: Error) =>
-      Alert.alert('Invite', 'Could not open that invite link: ' + (e?.message || 'unknown error'))
+    // Batch E (round-3 review R3-04): a link opened from outside the app used to
+    // join at once, handing the link's maker this phone's Vardum ID, identity key
+    // and nickname with no tap. Ask first.
+    const isGroup = /[?&]g=/.test(link); // Batch F (R4-4-18): the same test the join uses
+    Alert.alert(
+      isGroup ? 'Join this group?' : 'Join this chat?',
+      isGroup ? 'Joining shares your Vardum ID, identity key and nickname with whoever made this link, and links the group to your account. Only join links you trust.' : 'Joining shares your nickname with whoever made this link and starts a chat with them on your account. Only join links you trust.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Join', onPress: () => {
+          handleJoinInvite(link).catch((e: Error) =>
+            Alert.alert('Invite', 'Could not open that invite link: ' + (e?.message || 'unknown error'))
+          );
+        } },
+      ],
     );
+  }, [app, identity, locked, screen, inviteTick]);
+
+  // Batch E (Superagent round 3, F-3): a device transfer whose pickup this phone
+  // never saw (the app was closed or killed) is finished on the next unlock —
+  // retire the moved chats if the new phone collected them.
+  const pendingTransferCheckedRef = useRef(false);
+  useEffect(() => {
+    if (!app || !identity || locked || pendingTransferCheckedRef.current) return;
+    pendingTransferCheckedRef.current = true;
+    (async () => {
+      // Batch F (R4-4-13): every pending move, each on its own record
+      // Batch G (R5-3-02): one quick status check per move, newest first (it used to
+      // poll each for 11 minutes, in order). R5-3-09: a move the new phone fetched
+      // but never acknowledged (an older Vardum there sends no ack) is asked about
+      // once, after an hour, instead of leaving the chats on both phones in silence.
+      let retired = 0;
+      const all = (await loadPendingTransfers(app.storage)).sort((x, y) => y.createdAt - x.createdAt);
+      for (const pending of all) {
+        const res = await finishTransferMove({ relay: app.relay, sessions: app.sessions, storage: app.storage }, pending, { intervalMs: 1000, timeoutMs: 5000, returnOnFetched: true });
+        if (res.state === 'used') retired += res.retired;
+        // Batch H (round-6 reviews R6-1-11 / R6-3-12): asked once per move ("Not yet"
+        // is remembered), and the wording covers a new phone that said it could not
+        // save everything — the one case where removing here would be wrong
+        if (res.state === 'fetched' && !pending.askedAt && Date.now() - pending.createdAt > 3_600_000) {
+          const yes = await new Promise<boolean>((resolve) => Alert.alert(
+            'Did your new phone get your chats?',
+            'A transfer link from this phone was opened, but the new phone never confirmed the import. If the new phone said \u201cNot everything was saved\u201d, choose Not yet. If your chats are all on the new phone, remove them here so the two phones don\u2019t both hold them.',
+            [{ text: 'Not yet', style: 'cancel', onPress: () => resolve(false) }, { text: 'Remove from this phone', style: 'destructive', onPress: () => resolve(true) }],
+          ));
+          if (yes) {
+            retired += await retireTransferredSessions({ sessions: app.sessions }, pending.sessionTokens);
+            await clearPendingTransfer(app.storage, pending.token);
+          } else {
+            await markTransferAsked(app.storage, pending.token).catch(() => undefined);
+          }
+        }
+      }
+      if (!retired) return;
+      refreshSessionsRef.current?.();
+      Alert.alert('Moved to your new phone', retired === 1 ? 'Your chat now lives on the new phone and has been removed from this one.' : `Your ${retired} chats now live on the new phone and have been removed from this one.`);
+    })().catch(() => undefined);
   }, [app, identity, locked]);
 
   /** b139 welcome thread: "Don't show again" */
@@ -1370,6 +1700,9 @@ function VeilApp() {
       if (AppState.currentState !== 'active') return;
       if (lockedRef.current) return;
       if (!identityRef.current && !appLockRef.current) return;
+      // b199: a vault transfer in progress holds the no-touch timer (the
+      // clock restarts from zero when it ends); backgrounding still locks
+      if (autoLockHeld()) { veilActivityPing(); return; }
       if (Date.now() - VEIL_LAST_ACTIVITY >= AUTO_LOCK_MINUTES * 60000) setLocked(true);
     }, 5000);
     return () => clearInterval(iv);
@@ -1381,16 +1714,19 @@ function VeilApp() {
     if (!app) return;
     setBusy(true);
     try {
+      const pushTarget = await capturePushTargetOf(app); // Batch H (R6-1-01 / R6-3-10)
       for (const k of await app.storage.keys('veil_')) {
         if (k === 'veil_auth_session') continue;
-        await app.storage.remove(k).catch(() => undefined);
+        await secureRemove(app.storage, k).catch(() => undefined);
       }
+      await shredHardwareKey(); // Batch H (R6-1-02)
+      await dropPushRegistration(app, pushTarget); // Batch F (R4-4-17): no banners after a wipe (while still signed in)
       await app.auth.logout().catch(() => undefined);
-      for (const k of await app.storage.keys('veil_')) await app.storage.remove(k).catch(() => undefined); // login too now
+      for (const k of await app.storage.keys('veil_')) await secureRemove(app.storage, k).catch(() => undefined); // login too now
     } finally {
       setIdentity(null); setAppLock(null); setSettings(DEFAULTS);
       knownSessionTokensRef.current = null; setSessionRows([]); /* b178 re-seed */ setContactRows([]); setLocked(false); setBusy(false);
-      setScreen('login');
+      setScreen('identity'); // b199: back to the 24-word welcome, never the email screen
     }
   }, [app]);
 
@@ -1399,6 +1735,7 @@ function VeilApp() {
     if (!app) return;
     setBusy(true);
     try {
+      await dropPushRegistration(app); // Batch F (R4-4-17): no banners after a wipe
       await app.auth.deleteAccount(identity ? [identity.veilId] : []);
     } catch (e) {
       setBusy(false);
@@ -1406,10 +1743,10 @@ function VeilApp() {
       return;
     }
     try {
-      for (const k of await app.storage.keys('veil_')) await app.storage.remove(k).catch(() => undefined);
+      for (const k of await app.storage.keys('veil_')) await secureRemove(app.storage, k).catch(() => undefined);
     } finally {
       setIdentity(null); setAppLock(null); setSettings(DEFAULTS);
-      knownSessionTokensRef.current = null; setSessionRows([]); /* b178 re-seed */ setContactRows([]); setBusy(false); setScreen('login');
+      knownSessionTokensRef.current = null; setSessionRows([]); /* b178 re-seed */ setContactRows([]); setBusy(false); setScreen('identity'); // b199: 24-word welcome
     }
   }, [app, identity]);
 
@@ -1421,7 +1758,7 @@ function VeilApp() {
     const confirmed = await new Promise<boolean>((resolve) => {
       Alert.alert(
         'Sign out and wipe this device?',
-        'Signing out removes your identity, conversation keys and all local VEIL data from this device — only your 24-word recovery phrase can restore the identity here. Make sure you have it before continuing.',
+        'Signing out removes your identity, conversation keys and all local Vardum data from this device — only your 24-word recovery phrase can restore the identity here. Make sure you have it before continuing.',
         [
           { text: 'Cancel', style: 'cancel', onPress: () => resolve(false) },
           { text: 'Sign out & wipe', style: 'destructive', onPress: () => resolve(true) },
@@ -1437,10 +1774,13 @@ function VeilApp() {
       // and cached message on this device (and iOS keychain survives app
       // uninstall). Sign-out now wipes everything VEIL stored — the login
       // session itself is the last thing to go, inside auth.logout().
+      const pushTarget = await capturePushTargetOf(app); // Batch H (R6-1-01 / R6-3-10)
       for (const k of await app.storage.keys('veil_')) {
         if (k === 'veil_auth_session') continue; // logout() clears this itself
         await secureRemove(app.storage, k).catch(() => undefined);
       }
+      await shredHardwareKey(); // Batch H (R6-1-02)
+      await dropPushRegistration(app, pushTarget); // Batch F (R4-4-17): no banners after a wipe (while still signed in)
       // (b64) sign-out wipe claim says NOTHING recoverable stays on the
       // device — that includes the encrypted vault-container file cache and
       // any stray temp files, which live outside the keychain sweep above.
@@ -1456,7 +1796,7 @@ function VeilApp() {
       } catch { /* cache sweep is best-effort */ }
     } catch { /* wipe is best-effort; logout still proceeds */ }
     try { await app.auth.logout(); } finally {
-      setIdentity(null); setScreen('login'); setBusy(false);
+      setIdentity(null); setScreen('identity'); setBusy(false); // b199: 24-word welcome
     }
   }, [app]);
 
@@ -1499,6 +1839,7 @@ function VeilApp() {
         const raw = await app.storage.get('veil_dismissed_sessions');
         dismissed = raw ? (JSON.parse(raw) as string[]) : [];
       } catch { dismissed = []; }
+      const threadNames = await loadThreadNames(app.storage); // Batch G (R5-1-04)
       // b198 FRESHNESS GATE: record when the fetch STARTS, commit the stamp
       // only on success (below). A pass whose fetch began before the current
       // chat opened cannot have seen that chat's row — its result must never
@@ -1558,7 +1899,18 @@ function VeilApp() {
           if (ownSideVeilId && ownSideVeilId !== identity.veilId) continue;
         }
         // role-aware PEER id: the OTHER party, whichever side we are
-        const peerVeilId = String((mine ? rec.responder_veil_id : rec.initiator_veil_id) || peerId || '');
+        const rowPeerVeilId = String((mine ? rec.responder_veil_id : rec.initiator_veil_id) || peerId || '');
+        // Batch F (round-4 review R4-4-01, High): who a 1:1 chat is with comes from
+        // this phone's SEALED state (contact chats seal it at the handshake), not
+        // the relay row. A chat without a sealed peer (invite chats, chats from
+        // before b60) never wears the user's own nickname for a contact, and a
+        // row that disagrees with the sealed peer is flagged.
+        const sealedRow = await app.sessions.load(token).catch(() => null);
+        const sp = isGroup ? null : sealedPeer(sealedRow);
+        const peerLabelMismatch = !!(sp && rowPeerVeilId && rowPeerVeilId !== sp.veilId);
+        if (peerLabelMismatch) console.log(`[veil-sessions] #${token.slice(0, 4)}: the server's peer label differs from this phone's record — using this phone's`);
+        const peerVeilId = sp ? sp.veilId : rowPeerVeilId;
+        if (!isGroup) sessionContactRef.current[token] = !!sp && (sealedRow as { contact?: unknown } | null)?.contact === true;
         // b123 FIX (owner live-test screenshot, Sept 24): the TITLE lookup
         // used responder-OR-initiator WITHOUT checking which side we are —
         // so a session the user JOINED (responder side, e.g. the Founder
@@ -1566,7 +1918,7 @@ function VeilApp() {
         // because responder_veil_id is US on those rows. The title's peer
         // is always the OTHER party, exactly like peerVeilId: nickname
         // lookup and the raw-ID fallback both use the role-aware id.
-        const nick = peerVeilId ? await app.pins.getNickname(peerVeilId) : null;
+        const nick = (sp || isGroup) && peerVeilId ? await app.pins.getNickname(peerVeilId) : null; // Batch F (R4-4-01): own nickname only for a sealed peer
         // b68: the PEER's own self-chosen nickname (they set it on their side).
         // A name I gave them locally always wins; theirs is the fallback
         // before the raw Veil ID.
@@ -1574,22 +1926,36 @@ function VeilApp() {
           (mine ? rec.responder_display_name : rec.initiator_display_name) || '',
         ).trim();
         // web parity: verify ceremony is PER-SIDE — badge goes green only when BOTH sides did it
-        const myVerified = mine ? !!rec.initiator_verified : !!rec.responder_verified;
+        // Batch F (round-4 review R4-1-03): MY confirmation is the one sealed on
+        // this phone (bound to the fingerprint), never the relay row's flag. The
+        // peer's flag stays a relay hint for the badge.
+        const myVerified = !revokedTokensRef.current.has(token) && locallyVerified(sealedRow);
         const peerVerified = mine ? !!rec.responder_verified : !!rec.initiator_verified;
+        sessionVerifiedRef.current[token] = myVerified && peerVerified; // Batch E (N3-1)
+        // Batch G (round-5 review R5-3-06): my local seal is set but the row lost my flag
+        // (a whole-row write raced verify) — re-send it once, so the peer isn't locked out
+        if (myVerified && !(mine ? rec.initiator_verified : rec.responder_verified) && !verifyResentRef.current.has(token)) {
+          verifyResentRef.current.add(token);
+          app.relay.sessionVerify(token, (sealedRow as { writeSecret?: string | null } | null)?.writeSecret ?? null).catch(() => undefined);
+        }
         // b162 presence display (web parity): the PEER's last heartbeat on the
         // gate, parsed tz-safe (relay bare-ISO trap, b134). 0 = never seen.
         const peerSeenRaw = String((mine ? rec.responder_seen_at : rec.initiator_seen_at) || '');
         const peerSeenAt = peerSeenRaw ? (Date.parse(relayTimestampToIso(peerSeenRaw)) || 0) : 0;
-        let gTitle = nick || theirNick || peerVeilId || 'Anonymous session';
-        let gSub = `#${token.slice(0, 4).toUpperCase()} · ${rec.contact_session ? 'pinned contact' : 'invite session'}`;
+        // Batch G (round-5 review R5-1-04): a chat this phone didn't seal as being with a
+        // contact never wears a contact's name; it is an invite chat, named per chat
+        let gTitle = (!isGroup && !sp)
+          ? (threadNames[token] || `Invite chat · ${theirNick || '#' + token.slice(0, 4).toUpperCase()}`)
+          : (nick || theirNick || peerVeilId || 'Unnamed session');
+        let gSub = `#${token.slice(0, 4).toUpperCase()} · ${peerLabelMismatch ? '⚠ server label differs' : sessionContactRef.current[token] ? 'pinned contact' : 'invite session'}`; // Batch F (R4-4-01)
         if (isGroup) {
           try {
             gTitle = (await groupRowLabel(
               { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
               groupToken, String(rec.group_name ?? ''),
-            )) || 'VEIL group';
-          } catch { gTitle = 'VEIL group'; }
-          gSub = `VEIL group · epoch ${groupEpoch}`;
+            )) || 'Vardum group';
+          } catch { gTitle = 'Vardum group'; }
+          gSub = `Vardum group · epoch ${groupEpoch}`;
         }
         // b71 (owner report "groups show up twice"): one group = MANY rows here —
         // the creator's MAIN session + one invite row per link, all sharing the
@@ -1623,9 +1989,12 @@ function VeilApp() {
       // no-op purge is one storage read). Open threads purge themselves on
       // their own 1s tick above.
       for (const r of rows) {
-        const d = sessionDialsRef.current[r.token];
-        if (r.status === 'active' && d?.burn && d.burnSecs > 0) {
-          app.sessions.purgeBurnedMessages(r.token, d.burnSecs).then(async (purged) => {
+        // Batch E (R1-01): the session's own dials, not the relay row's
+        // Batch F (R4-4-14): no readable sealed session, no purge (never the row's dials)
+        const sealedB = r.status === 'active' ? await app.sessions.load(r.token).catch(() => null) : null;
+        const d = sealedB ? burnWindow(sealedB, sessionDialsRef.current[r.token]) : null;
+        if (d?.burn && d.secs > 0) {
+          app.sessions.purgeBurnedMessages(r.token, d.secs).then(async (purged) => {
             // b90: burned rows can no longer be "waiting to read" — decay the
             // badge by the same count so it never points at an empty thread.
             if (purged.length > 0) {
@@ -1677,7 +2046,12 @@ function VeilApp() {
         let joinedNow = false;
         for (const gt of listGroupTokens(app.storage)) {
           const rec = groupRecord(app.storage, gt);
-          if (rec && !rec.sessionEnded && rec.role === 'forum-member') { joinedNow = true; break; }
+          // D-04 (owner, Oct 18): only a membership in the CURRENT (pinned) forum retires
+          // the banner — a phone still holding the old, rotated-away forum must see Join again
+          if (rec && !rec.sessionEnded && rec.role === 'forum-member' && (!FORUM_PIN || gt === FORUM_PIN.groupToken)) { joinedNow = true; break; }
+          // D-04 (owner, Oct 18): the founder's phone holds the pinned forum as its creator
+          // record — it never joins its own forum, so no Join banner there
+          if (rec && rec.role === 'creator' && FORUM_PIN && gt === FORUM_PIN.groupToken) { joinedNow = true; break; }
         }
         setForumJoined(joinedNow);
         const loungeRows = listGroupTokens(app.storage)
@@ -1713,6 +2087,12 @@ function VeilApp() {
           }
         }
       } catch (e) { console.log('[veil-lounge] row synthesis skipped:', (e as Error).message); }
+      // Play UGC: chats and chat requests from a blocked Vardum ID stay hidden
+      if (blockedRef.current.size) {
+        const keep = collapsed.filter((r) => r.groupToken || !r.peerVeilId || !blockedRef.current.has(r.peerVeilId));
+        collapsed.length = 0;
+        collapsed.push(...keep);
+      }
       setSessionRows(collapsed);
       listRefreshedAtRef.current = listFetchStartedAt; // b198 freshness gate: a successful, post-open fetch
       // b178 (owner report Oct 2: "you don't get push notifications for new
@@ -1827,6 +2207,17 @@ function VeilApp() {
     }, 10000);
     return () => clearInterval(iv);
   }, [screen, refreshSessions, refreshContacts]);
+
+  // Pixel test Oct 20: the pass above runs before the first refreshSessions
+  // lands, so it sees zero rows; the list then showed nothing new for up to
+  // 10s after unlock (a pushed message only appeared once the thread was
+  // opened). Run one pass as soon as the rows first arrive.
+  const rowsLoaded = sessionRows.length > 0;
+  useEffect(() => {
+    if (!rowsLoaded || (screen !== 'main' && screen !== 'chat')) return;
+    backgroundSyncAllSessionsRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rowsLoaded]);
 
   // b155 PRESENCE HEARTBEAT: web peers show us "online" from the gate's
   // seen_at fields — sessionHeartbeat has existed on the relay client since
@@ -1995,7 +2386,13 @@ function VeilApp() {
       supersedeInFlightRef.current.add(deadToken);
       (async () => {
         try {
-          try { await app?.sessions.remove(deadToken); } catch { /* residue already gone */ }
+          // Batch E (round-3 review R3-02): the list is capped and other accounts
+          // can add rows to it, so a missing row is not proof. Ask the relay about
+          // THIS session; anything but a definite "not found" keeps the keys.
+          if (!app) return;
+          const ws = ((await app.sessions.load(deadToken)) as { writeSecret?: string | null } | null)?.writeSecret ?? null;
+          if ((await relaySessionLiveness(app.relay, deadToken, ws)) !== 'gone') { console.log(`[veil] session #${deadToken.slice(0, 4)} is off the list but still on the relay — keeping it`); return; }
+          try { await app.sessions.remove(deadToken); } catch { /* residue already gone */ }
           setError(null);
           await openChatRef.current?.(replacement.token, replacement.title, replacement.subtitle, replacement.status, replacement.peerVeilId ?? null, !!replacement.myVerified, !!replacement.peerVerified, undefined);
         } finally {
@@ -2007,8 +2404,13 @@ function VeilApp() {
     if (misses < 2) return; // two consecutive misses = genuinely gone
     console.log(`[veil] session #${chat.token.slice(0, 4)} no longer exists server-side (absent from ${misses} consecutive list refreshes) — closing thread, clearing local state`);
     goneMissRef.current[chat.token] = 0;
+    const goneToken = chat.token;
     (async () => {
-      try { await app?.sessions.remove(chat.token); } catch { /* residue already gone */ }
+      // Batch E (R3-02): confirm with the relay before deleting any keys
+      if (!app) return;
+      const ws = ((await app.sessions.load(goneToken)) as { writeSecret?: string | null } | null)?.writeSecret ?? null;
+      if ((await relaySessionLiveness(app.relay, goneToken, ws)) !== 'gone') { console.log(`[veil] session #${goneToken.slice(0, 4)} is off the list but still on the relay — keeping it`); return; }
+      try { await app.sessions.remove(goneToken); } catch { /* residue already gone */ }
       setChat(null);
       setScreen('main');
       refreshSessions();
@@ -2091,8 +2493,16 @@ function VeilApp() {
     if (decoyMode) { decoyBlocked(); return; }
     if (!app) return;
     const cur = chatRef.current;
-    if (!cur?.token || !cur.peerVeilId) return;
-    await app.pins.setNickname(cur.peerVeilId, name || '');
+    if (!cur?.token) return;
+    // Batch G (round-5 review R5-1-04): only a chat sealed as being with a contact
+    // renames that contact; an invite chat is renamed per chat (THREAD_NAMES_KEY)
+    const sp = sealedPeer(await app.sessions.load(cur.token).catch(() => null));
+    if (sp) await app.pins.setNickname(sp.veilId, name || '');
+    else {
+      const names = await loadThreadNames(app.storage);
+      if (name) names[cur.token] = name; else delete names[cur.token];
+      await app.storage.set(THREAD_NAMES_KEY, JSON.stringify(names));
+    }
     setChatLocalNick(name || null);
     // optimistic patch: the 10s list poll re-syncs the title from the rows
     setSessionRows((prev) => prev.map((r) => (r.token === cur.token ? { ...r, title: name || r.title } : r)));
@@ -2123,6 +2533,13 @@ function VeilApp() {
     if (!app || !identity) {
       setContactsError('Create or restore your identity first.');
       setError('Create or restore your identity first.');
+      return;
+    }
+    // Play UGC: a blocked contact's threads are hidden, so don't start one
+    if (blockedRef.current.has(veilId)) {
+      const m = 'You blocked this person. Unblock them in Settings first.';
+      setContactsError(m);
+      setError(m);
       return;
     }
     // b167: the identity gate's rate-limit lock (HTTP 429, retry_minutes)
@@ -2210,6 +2627,16 @@ function VeilApp() {
             return !newCreated || String(rec.created_date ?? '') <= newCreated;
           })
           .map((rec) => ({ token: String(rec.token), recId: String(rec.id ?? '') }));
+        // Batch F (R4-1-04): the relay's peer label only nominates; a chat is ended
+        // only if its SEALED peer is this contact (or it is the thread the user
+        // pressed + in). A relabelled row can't get an unrelated chat ended.
+        const pressedIn = chatRef.current?.token ?? null;
+        const checked: { token: string; recId: string }[] = [];
+        for (const s of staleTokens) {
+          const sp = sealedPeer(await app.sessions.load(s.token).catch(() => null));
+          if (s.token === pressedIn || (sp && sp.veilId === veilId)) checked.push(s);
+        }
+        staleTokens = checked;
       } catch { /* list failure → fall back to no supersede rather than block the open */ }
       for (const stale of staleTokens) {
         try {
@@ -2291,6 +2718,8 @@ function VeilApp() {
       // inviter-side ceremony errored. The gate's verify action returns the
       // updated session record in its own response; native now confirms OUR
       // slot's flag on that response and never peeks.
+      // Batch G (NF-1): nothing to compare on this phone — don't tell the relay it was verified
+      if (!(sealedV as { fingerprint?: string | null } | null)?.fingerprint) { console.log('[veil-verify] no safety code on this phone — not verifying'); return false; }
       const vk = await app.relay.sessionVerify(token, ws);
       const vd = vk.data as { data?: { session?: Record<string, unknown> }; session?: Record<string, unknown> };
       const rec = vd?.data?.session ?? vd?.session ?? (vk.data as Record<string, unknown>);
@@ -2301,6 +2730,7 @@ function VeilApp() {
         console.log('[veil-verify] verify response did not confirm our side', JSON.stringify({ initiator_verified: rec.initiator_verified, responder_verified: rec.responder_verified }));
         return false;
       }
+      await markLocallyVerified(app.sessions, token); // Batch F (R4-1-03): the gate's own record
             setChat((c) => c && c.token === token ? { ...c, myVerified: true } : c);
       await refreshSessions();
       return true;
@@ -2330,11 +2760,14 @@ function VeilApp() {
       const lk = await handleLookup(veilId);
       if (!lk) { setError('Could not find that identity on the relay.'); return; }
       await app.pins.pin(veilId, lk.ikPubB64);
-      if (chat && chat.token === token && chat.myVerified && chat.peerVerified) {
-        await app.pins.markVerified(veilId);
-      }
+      // Batch F (round-4 review R4-4-02, High): an invite chat never binds the
+      // other person's identity key, and the peer ID here comes from the relay row,
+      // so this pin is trust-on-first-use. It is never marked verified from the
+      // session's (relay-held) flags; the ✓ comes only from the contact
+      // safety-code check, which is bound to the pinned key.
       setChat((c) => c && c.token === token ? { ...c, peerPinned: true } : c);
       await refreshContacts();
+      Alert.alert('Added as a contact — not verified yet', 'To verify them, open the contact and compare its safety code with theirs, in person or on a call.');
     } catch (e) {
       setError('Could not pin that contact — please try again.');
     }
@@ -2343,7 +2776,7 @@ function VeilApp() {
   const handleUnlock = useCallback(async () => {
     setLockHint('Authenticating…');
     try {
-      const bio = await LocalAuthentication.authenticateAsync({ promptMessage: 'Unlock Veil' });
+      const bio = await LocalAuthentication.authenticateAsync({ promptMessage: 'Unlock Vardum' });
       if (bio.success) { setLocked(false); setLockHint(null); veilActivityPing(); }
       else if (bio.error === 'not_available' || !(await LocalAuthentication.hasHardwareAsync())) {
         // no biometrics enrolled on this device — passcode gate is the OS itself
@@ -2444,6 +2877,15 @@ function VeilApp() {
     // legitimately has no local keys — the accept creates them)
     let recState = 'unknown';
     let joinedHere = true;
+    // Pixel test Oct 20 (and the "verify only works after re-entering the
+    // thread" report): the safety code lands in the sealed state only when the
+    // handshake completes, but openChat read it once on entry. A chat opened
+    // before the peer accepted kept a null code, so the ceremony stayed
+    // disabled until the thread was reopened. Hand the code to the open chat.
+    const shareFingerprint = async (): Promise<void> => {
+      const fp = ((await app.sessions.load(token)) as { fingerprint?: string | null } | null)?.fingerprint ?? null;
+      if (fp) setChat((c) => (c && c.token === token && c.fingerprint !== fp ? { ...c, fingerprint: fp } : c));
+    };
     try {
       const r = await app.relay.sessionList(who, identity.veilId);
       const list = (r.data as { data?: unknown[] })?.data ?? (r.data as { sessions?: unknown[] })?.sessions ?? (r.data as unknown as unknown[]);
@@ -2455,17 +2897,25 @@ function VeilApp() {
       joinedHere = rec.responder_veil_id === identity.veilId ? !!rec.responder_pub_jwk : true;
       const iAmInitiator = rec.initiator_veil_id === identity.veilId;
       const iAmResponder = rec.responder_veil_id === identity.veilId;
+      // Batch G (round-5 review R5-1-06): a chat this phone already holds is never
+      // re-accepted because the row now names me as the responder
+      if (sealed && iAmResponder && !iAmInitiator) { console.log(`[veil] #${token.slice(0, 4)}: the server's row names this phone as the responder of a chat it already holds — ignored`); return false; }
+      // Batch H (round-6 review R6-1-09): a request from a blocked Vardum ID is never
+      // accepted or pinned automatically (none at all until the block list has loaded)
+      if (iAmResponder && !iAmInitiator && (!blockListLoadedRef.current || blockedRef.current.has(String(rec.initiator_veil_id ?? '')))) return false;
       if (iAmResponder && !iAmInitiator) {
         // responder side: accept + join (derives ready chains immediately)
         // b69 FIX: same stale-closure bug as handleMessage above — advanceHandshake's
         // deps are [app, identity] only, so a nickname set after boot never rode the accept.
         await acceptOneTapSession({ relay: app.relay, pins: app.pins, sessions: app.sessions }, identity, rec as never, who, settingsRef.current.nickname || undefined);
+        await shareFingerprint();
         return !!(await app.sessions.load(token))?.ready;
       }
       if (iAmInitiator) {
         // SPEC gate: complete exactly once, only when accepted
         if (rec.state === 'active' && rec.responder_pub_jwk && rec.responder_ratchet_pub_jwk) {
           await completeContactHandshake(app.relay, app.sessions, token, rec);
+          await shareFingerprint();
           return true;
         }
         return false;
@@ -2483,6 +2933,7 @@ function VeilApp() {
       // ceremony state; reusing `rec` here skips peek entirely and completes
       // straight from data we already hold.
       await completeContactHandshake(app.relay, app.sessions, token, rec as never).catch(() => undefined);
+      await shareFingerprint();
       return !!(await app.sessions.load(token))?.ready;
     } catch (e) {
       // b80 (owner report: message "just slipped into conversations, no
@@ -2555,7 +3006,7 @@ function VeilApp() {
       // fetch permanently stalls once a session passes 200 total envelopes.
       const startSkip = ready ? await app.sessions.syncSkip(token) : 0;
       const res = ready
-        ? await syncChat(app.relay, app.sessions, token, who, chatKnown, false, startSkip)
+        ? await syncChat(app.relay, app.sessions, token, who, chatKnown, false, startSkip, sessionDialsRef.current[token]?.burnSecs || 0)
         : { messages: [] as never[], processedIds: [] as string[], nextSkip: startSkip };
       if (ready && !(res as { ended?: boolean }).ended) {
         await app.sessions.saveSyncSkip(token, (res as { nextSkip: number }).nextSkip);
@@ -2564,9 +3015,9 @@ function VeilApp() {
       // filtered from the chat list inside syncChat — hand them to the call
       // manager so the overlay can ring/connect. Fire-and-forget on purpose:
       // a call setup must never block the message pipeline.
-      const callSigs = (res as { callSignals?: { __veil_call: 1; op: 'offer' | 'answer' | 'ice' | 'end'; call_id: string; sdp?: string; k?: string; cand?: string; reason?: string; seq?: number }[] }).callSignals;
+      const callSigs = (res as { callSignals?: { __veil_call: 1; op: 'offer' | 'answer' | 'ice' | 'end' | 'ringing'; call_id: string; sdp?: string; k?: string; cand?: string; reason?: string; seq?: number }[] }).callSignals;
       if (ready && callSigs?.length) {
-        void CallManager.handleSignals(token, callSigs).catch((e) => console.log(`[veil-call] signal dispatch error: ${(e as Error).message}`));
+        if (callSignalsAllowed(token)) void CallManager.handleSignals(token, callSigs).catch((e) => console.log(`[veil-call] signal dispatch error: ${(e as Error).message}`));
       }
       // knownIds must include EVERY envelope decrypted this pass (visible
       // chat text + filtered cover/intro/receipt control payloads) or the
@@ -2716,6 +3167,26 @@ function VeilApp() {
         // b69: receipts survive close/reopen (cache previously never updated)
         app.sessions.markCachedRead(token, readIds).catch(() => undefined);
       }
+      // b199: the peer's reactions
+      void applyPeerReactionsRef.current(token, (res as { reactions?: { target: string; emoji: string | null }[] }).reactions);
+      // Batch E (Superagent round 3, F-1): the relay keeps refusing a burn — say so
+      // once in the thread instead of giving up silently
+      if ((res as { burnStuck?: number }).burnStuck && chatRef.current?.token === token) {
+        const note: (ChatMessage & { systemNote?: string }) = {
+          id: `burnstuck_${token}`, text: '', mine: false, ts: new Date().toISOString(),
+          systemNote: 'The server has not confirmed deleting a burned message yet. Vardum keeps asking. The server copy expires on its own when the message’s expiry is reached (at most 30 days).',
+        };
+        setChatMessages((prev) => (prev.some((m) => m.id === note.id) ? prev : [...prev, note]));
+      }
+      // Batch H (round-6 review R6-1-06 / R5-1-09): the phone's storage refused this
+      // chat's state or its burn queue — say so once in the thread (reading still works)
+      if (((res as { stateNotSaved?: boolean }).stateNotSaved || (res as { burnQueueTrouble?: boolean }).burnQueueTrouble) && chatRef.current?.token === token) {
+        const note: (ChatMessage & { systemNote?: string }) = {
+          id: `storage_${token}`, text: '', mine: false, ts: new Date().toISOString(),
+          systemNote: 'This phone’s storage refused to save part of this chat. Messages still open, but free up some space soon so nothing is lost.',
+        };
+        setChatMessages((prev) => (prev.some((m) => m.id === note.id) ? prev : [...prev, note]));
+      }
       // b175: a clean pass resets this token's backoff — the limiter only
       // matters while it's actively firing, not as a lingering penalty.
       if (!(res as { rateLimited?: boolean }).rateLimited) {
@@ -2818,7 +3289,7 @@ function VeilApp() {
       // b87: same pagination cursor as the foreground poll — background
       // sync hits the identical 200-row stale-head stall otherwise.
       const startSkip = await app.sessions.syncSkip(token);
-      const res = await syncChat(app.relay, app.sessions, token, who, new Set(), false, startSkip);
+      const res = await syncChat(app.relay, app.sessions, token, who, new Set(), false, startSkip, sessionDialsRef.current[token]?.burnSecs || 0);
       if (!res.ended) await app.sessions.saveSyncSkip(token, res.nextSkip);
       // b196: adaptive backoff bookkeeping (see pollBackoffRef)
       const nothingNew = !res.processedIds?.length && !(res as { callSignals?: unknown[] }).callSignals?.length;
@@ -2838,9 +3309,9 @@ function VeilApp() {
       // the foreground path does (fire-and-forget, never blocks message
       // handling). b149 mounted the overlay on every screen; THIS was the
       // missing half of "calls ring anywhere".
-      const bgCallSigs = (res as { callSignals?: { __veil_call: 1; op: 'offer' | 'answer' | 'ice' | 'end'; call_id: string; sdp?: string; k?: string; cand?: string; reason?: string; seq?: number }[] }).callSignals;
+      const bgCallSigs = (res as { callSignals?: { __veil_call: 1; op: 'offer' | 'answer' | 'ice' | 'end' | 'ringing'; call_id: string; sdp?: string; k?: string; cand?: string; reason?: string; seq?: number }[] }).callSignals;
       if (bgCallSigs?.length) {
-        void CallManager.handleSignals(token, bgCallSigs, peerLabel).catch((e) =>
+        if (callSignalsAllowed(token)) void CallManager.handleSignals(token, bgCallSigs, peerLabel).catch((e) =>
           console.log(`[veil-call] background signal dispatch error: ${(e as Error).message}`));
       }
       // b92 F1 (b91 audit): a stray or genuine desync classified while this
@@ -2870,6 +3341,8 @@ function VeilApp() {
             ((m.envId && rset.has(m.envId)) || rset.has(m.id) ? { ...m, read: true, openedAt: Date.now() } : m))); // b198: burn clock anchors at receipt
         }
       }
+      // b199: the peer's reactions (cache always; live thread if open)
+      await applyPeerReactionsRef.current(token, (res as { reactions?: { target: string; emoji: string | null }[] }).reactions);
       // b92 F9 (b91 audit, traffic-analysis parity): web idles keep emitting
       // cover envelopes while the app is open on any screen; native previously
       // sent cover ONLY while a thread was foregrounded, letting a relay
@@ -2984,11 +3457,23 @@ function VeilApp() {
               burnAfterOpen: !!sessionDialsRef.current[tok]?.burn,
               identity: { veilId: identity.veilId, ikSeedB64: identity.ikSeedB64, ikPubB64: identity.ikPubB64, pqPrivB64: identity.pqPrivB64 },
               knownIds: groupKnownRef.current,
+              // b54 (device test Oct 18): PEEK, never consume — the old
+              // background pass marked + burned messages it only notified
+              // about, so they never rendered when the thread was opened.
+              peekOnly: true,
               events: {
                 // background arrival: contentless banner + unread badge — the
-                // message body renders when the user opens the thread.
-                onMessage: () => { void notifyNewMessage(); },
-                onSystem: () => { void notifyNewMessage(); },
+                // message body renders when the user opens the thread. Peek
+                // re-reads the same rows every pass, so notify each id ONCE.
+                onMessage: (m) => {
+                  if (groupPeekNotifiedRef.current.has(m.envelopeId)) return;
+                  // Batch H (round-6 review R6-2-05): no banner until the block list has loaded
+                  if (!blockListLoadedRef.current) return;
+                  groupPeekNotifiedRef.current.add(m.envelopeId);
+                  if (isFromBlocked({ senderVid: m.senderVeilId }, blockedRef.current)) return; // Play UGC
+                  void notifyNewMessage();
+                },
+                onSystem: () => undefined,
                 onRead: () => undefined,
                 onRotated: () => undefined,
                 onSenderVerifyFailed: () => undefined,
@@ -3043,10 +3528,14 @@ function VeilApp() {
                   sender: info.senderNick || 'Founder',
                   senderVerified: info.senderVerified,
                   openedAt: Date.now(),
+                  ...(info.senderVeilId ? { senderVid: info.senderVeilId } : {}),
                   ...(info.media ? { media: { uri: info.media.uri, k: info.media.k, iv: info.media.iv, mime: info.media.mime, name: info.media.name, size: info.media.size, dl: !!info.media.dl } } : {}),
                 };
                 setChatMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
                 app.sessions.cacheMessages(token, [msg]).catch(() => undefined);
+                // Play UGC: a blocked sender's post is kept (unblock shows it) but never notifies
+                // Batch H (R6-2-05): nor does anything before the block list has loaded
+                if (!blockListLoadedRef.current || isFromBlocked(msg, blockedRef.current)) return;
                 // b197-r8m (BURN-ON-HUMAN-OPEN): this render IS the human-open
                 // moment — unlock the envelope's burn (fires next sync pass).
                 if (sessionDialsRef.current[token]?.burn) {
@@ -3068,6 +3557,12 @@ function VeilApp() {
                   systemNote: info.note,
                 };
                 setChatMessages((prev) => (prev.some((m) => m.id === sysMsg.id) ? prev : [...prev, sysMsg]));
+              },
+              // Play UGC: the founder removed these posts for everyone
+              onRemove: (ids) => {
+                const gone = new Set(ids);
+                setChatMessages((prev) => prev.filter((m) => !gone.has(m.id) && !(m.envId && gone.has(m.envId))));
+                app.sessions.removeCachedMessages(token, ids).catch(() => undefined);
               },
               // Fail-closed lounge policy: forged/unsigned/non-founder rows are
               // logged and discarded — never a user-facing error (the lounge
@@ -3105,6 +3600,8 @@ function VeilApp() {
         { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
         {
           groupToken,
+          isBlocked: (vid: string) => blockedRef.current.has(vid), // Batch F (R4-2-02)
+          blockListReady: () => blockListLoadedRef.current, // Batch H (R6-2-05)
           // b132: relay-side group burn — this member's own session credential
           // (gate group clause authorises it) so opened envelopes don't sit
           // on the relay at the 24h submit TTL forever.
@@ -3112,6 +3609,9 @@ function VeilApp() {
           burnAfterOpen: !!sessionDialsRef.current[token]?.burn,
           identity: { veilId: identity.veilId, ikSeedB64: identity.ikSeedB64, ikPubB64: identity.ikPubB64, pqPrivB64: identity.pqPrivB64 },
           knownIds: groupKnownRef.current,
+          // Batch C (A1): lets the creator publish the signed member list and a
+          // not-yet-admitted member re-send its seat-proven intro
+          clientId: who,
           events: {
             onMessage: (info) => {
               const msg: (ChatMessage & { sender?: string; senderVerified?: boolean }) = {
@@ -3126,11 +3626,13 @@ function VeilApp() {
                 // openedAt the burn purge treats the row as never-displayed
                 // and it can never burn while the thread stays open.
                 openedAt: Date.now(),
+                ...(info.senderVeilId ? { senderVid: info.senderVeilId } : {}),
                 ...(info.media ? { media: { uri: info.media.uri, k: info.media.k, iv: info.media.iv, mime: info.media.mime, name: info.media.name, size: info.media.size, dl: !!info.media.dl } } : {}),
               };
               setChatMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
               app.sessions.cacheMessages(token, [msg]).catch(() => undefined); // b62: group history survives reopen
-              if (AppState.currentState !== 'active' || !chatRef.current || chatRef.current.token !== token) {
+              // Play UGC: a blocked sender's message is kept (unblock shows it) but never notifies
+              if ((AppState.currentState !== 'active' || !chatRef.current || chatRef.current.token !== token) && blockListLoadedRef.current && !isFromBlocked(msg, blockedRef.current)) {
                 notifyNewMessage();
                 // b90: group messages landing on a closed thread badge it too
                 app.sessions.bumpUnread(token, 1).then((next) => {
@@ -3180,6 +3682,31 @@ function VeilApp() {
             onRotated: (newEpoch) => {
               setGroupInfo((gi) => (gi ? { ...gi, epoch: newEpoch } : gi));
             },
+            // Play UGC: a forum report sealed to this phone (the founder's). Kept in
+            // the thread history so it survives a reopen; opened only here.
+            onReport: ({ envelopeId, reporterVeilId, report, sentAt }) => {
+              // Batch E (F-2): the pinned forum only, and never from a blocked tester
+              if (!(FORUM_PIN && groupToken === FORUM_PIN.groupToken)) return;
+              if (reporterVeilId && blockedRef.current.has(reporterVeilId)) return;
+              const by = reporterVeilId ? reporterVeilId : 'a tester';
+              // Batch H (round-6 review R6-2-06): the post id, author and quote are the
+              // reporter's word. Look the post up here; show the real sender and text
+              // when it is on this phone, and say so plainly when it is not.
+              void (async () => {
+                const cached = await app.sessions.cachedMessages(token).catch(() => [] as ChatMessage[]);
+                const post = cached.find((m) => m.id === report.postId || m.envId === report.postId) as (ChatMessage & { senderVid?: string }) | undefined;
+                const body = post
+                  ? `about a post by ${post.senderVid || 'a tester'}: “${String(post.text ?? '').slice(0, 200)}”`
+                  : `about ${report.authorVeilId ? `a post by ${report.authorVeilId}` : 'a post'} (as quoted by the reporter; the post is not on this phone): “${report.excerpt.slice(0, 200)}”`;
+                const msg: (ChatMessage & { systemNote?: string }) = {
+                  id: `report_${envelopeId}`, text: '', mine: false, ts: sentAt,
+                  systemNote: `⚠ Report from ${by} ${body} — ${report.reason || 'no reason given'}. Long-press the post to remove it for everyone.`,
+                };
+                setChatMessages((prev) => (prev.some((m) => m.id === msg.id) ? prev : [...prev, msg]));
+                app.sessions.cacheMessages(token, [msg]).catch(() => undefined);
+                if (AppState.currentState !== 'active' || !chatRef.current || chatRef.current.token !== token) notifyNewMessage();
+              })();
+            },
             onSenderVerifyFailed: (envelopeId) => {
               const msg: (ChatMessage & { systemNote?: string }) = {
                 id: `sig_${envelopeId}`, text: '', mine: false, ts: new Date().toISOString(),
@@ -3211,6 +3738,45 @@ function VeilApp() {
       );
       if (res) {
         setGroupInfo((gi) => gi ? { ...gi, members: res.members, fingerprint: res.fingerprint } : gi);
+        // Batch E (round-3 review F-3): a group made before Batch C — its creator
+        // confirms the old member list once instead of trusting the server's copy
+        const legacy = res.legacyRosterToConfirm ?? [];
+        // Batch F (round-4 reviews R4-4-08 / R4-2-03): one decision per member, with
+        // the name the user gave them and whether they are a contact whose key
+        // matches; leaving someone out is the default. "Not now" waits until the
+        // next app launch (the notice key stays set for this run).
+        if (legacy.length && chatRef.current?.token === token && !groupBehindNoticeRef.current.has(`legacy_${groupToken}`)) {
+          groupBehindNoticeRef.current.add(`legacy_${groupToken}`);
+          const ask = (title: string, message: string, buttons: { text: string; style?: 'cancel' | 'destructive' | 'default'; value: boolean }[]) =>
+            new Promise<boolean>((resolve) => Alert.alert(title, message, buttons.map((b) => ({ text: b.text, style: b.style, onPress: () => resolve(b.value) })), { cancelable: false }));
+          void (async () => {
+            const review = await ask(
+              'Check who is in this group',
+              `This group was made with an older version of Vardum. The server lists ${legacy.length} member(s). Only the people you confirm will get the group's keys, including the current key, so they can read what is still stored for this group.`,
+              [{ text: 'Not now', style: 'cancel', value: false }, { text: 'Review members', value: true }],
+            );
+            if (!review) return;
+            const chosen: string[] = [];
+            for (const m of legacy) {
+              const nick = await app.pins.getNickname(m.veilId).catch(() => null);
+              const pin = await app.pins.getPin(m.veilId).catch(() => null);
+              const status = !pin ? 'Not in your contacts.' : pin.ikPubB64 === m.ikPub ? 'In your contacts, and their key matches.' : '⚠ In your contacts, but their key is DIFFERENT from the one you saved.';
+              const yes = await ask(
+                nick ? `${nick}` : 'Is this someone you invited?',
+                `Vardum ID ${m.veilId}\n${status}\n\nOnly confirm people you know you invited.`,
+                [{ text: 'Leave out', style: 'cancel', value: false }, { text: 'Confirm', value: true }],
+              );
+              if (yes) chosen.push(m.ikPub);
+            }
+            // Batch G (round-5 review R5-2-06): a failed save is reported, not hidden
+            const savedOk = await confirmLegacyRoster(app.storage, groupToken, chosen).then(() => true).catch(() => false);
+            // Batch H (round-6 review R6-2-07): the choices may still take effect in this run
+            if (!savedOk) { Alert.alert('May not have been saved', 'Your choices may not have been saved on this phone. If they were not, you will be asked again next time.'); return; }
+            Alert.alert('Members confirmed', chosen.length === legacy.length
+              ? 'Everyone on the list is confirmed.'
+              : `${chosen.length} confirmed, ${legacy.length - chosen.length} left out. To bring someone back: they delete the group on their phone, then you send them a new invite with Add people.`);
+          })().catch(() => undefined);
+        }
         // creator auto-rotation: 100 envelopes / 24 h per epoch (web parity)
         // b190 (owner Metro log Oct 11: auto-rotate re-fired every 3s poll
         // against a member with no published PQ prekey, each attempt doing
@@ -3222,6 +3788,7 @@ function VeilApp() {
         const rotRec = await loadGroupRecord(app.storage, groupToken);
         const rotBlockedUntil = Number(rotRec?.rotateBlockedUntil ?? 0);
         if (res.needsRotation && chatRef.current?.token === token
+            && !(FORUM_PIN && groupToken === FORUM_PIN.groupToken) // Batch E (F-1): never auto-rotate the forum
             && !app.relay.gateHot() && Date.now() >= rotBlockedUntil) {
           const main = await findMainGroupSession({ relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL }, groupToken, who);
           if (main) {
@@ -3233,7 +3800,7 @@ function VeilApp() {
               })
               .catch(async (e) => {
                 const rmsg = String((e as Error)?.message ?? e);
-                if (/no published PQ prekey/i.test(rmsg)) {
+                if (/no (published|signed) PQ prekey/i.test(rmsg)) {
                   // persist the 15-min cooldown ONLY onto a real record —
                   // never fabricate one (a missing record is its own problem)
                   const rec2 = await loadGroupRecord(app.storage, groupToken);
@@ -3408,10 +3975,11 @@ function VeilApp() {
     // chains — the 24h UNOPENED dial must never masquerade as a burn window;
     // defaultTtlSeconds is captured on every create/join path (7200
     // fallback) so the dial-derived value is the honest one.
-    const dials0 = sessionDialsRef.current[token];
-    const burnSecs0 = Number(sealedInfo?.defaultTtlSeconds) || Number(dials0?.burnSecs) || 0;
+    // Batch E (R1-01): the session's own dials win; the row only for a legacy thread
+    const win0 = sealedInfo ? burnWindow(sealedInfo, sessionDialsRef.current[token]) : { burn: false, secs: 0 }; // Batch G (R5-1-02)
+    const burnSecs0 = win0.secs;
     let history0 = history;
-    if ((sealedInfo?.burnAfterOpen ?? dials0?.burn) && burnSecs0 > 0) {
+    if (win0.burn && burnSecs0 > 0) {
       await app.sessions.purgeBurnedMessages(token, burnSecs0);
       history0 = (await app.sessions.listMessages(token));
     }
@@ -3457,7 +4025,10 @@ function VeilApp() {
     setDraft('');
     setThreadReady(!!(await app.sessions.load(token))?.ready);
     // web parity: 'New chat thread with the same person' only for PINNED peers
-    const canNewThread = !!(peerVeilId && (await app.pins.getPin(peerVeilId)));
+    // Batch G (round-5 review R5-1-04): "+" and the contact badge only when this phone
+    // sealed the chat as being with that contact under the pinned key
+    const pinForChat = peerVeilId ? await app.pins.getPin(peerVeilId) : null;
+    const canNewThread = !!(peerVeilId && pinForChat && sealedPeerMatches(sealedInfo, peerVeilId, pinForChat.ikPubB64));
     // b74 BURN-COUNTDOWN FIX (owner report: countdown never renders on
     // native while web shows it): TWO bugs. (1) The window used the WRONG
     // dial — expireAfterSeconds is the "unopened messages expire" dial; the
@@ -3467,9 +4038,9 @@ function VeilApp() {
     // native join path, so sealedInfo.burnAfterOpen was false/undefined and
     // the countdown silently never rendered. Now: sealed extras first, then
     // the relay record's dials (stashed by refreshSessions).
-    const dials = sessionDialsRef.current[token];
-    const burnOn = sealedInfo?.burnAfterOpen ?? dials?.burn ?? false;
-    const burnSecs = Number(sealedInfo?.defaultTtlSeconds) || dials?.burnSecs || 0;
+    const win = sealedInfo ? burnWindow(sealedInfo, sessionDialsRef.current[token]) : { burn: false, secs: 0 }; // Batch E (R1-01); Batch G (R5-1-02)
+    const burnOn = win.burn;
+    const burnSecs = win.secs;
     // b163 (web P1.2 parity): key change revokes prior confirmation — if the
     // peer's CURRENT published identity key no longer matches the pinned one,
     // this thread's ceremony flags are treated as revoked and the gate
@@ -3483,9 +4054,14 @@ function VeilApp() {
           const lr = await app.relay.identityLookup(peerVeilId);
           const pub = ((lr.data as { data?: Record<string, string> })?.data ?? (lr.data as Record<string, string>)) || null;
           if (pub?.IK_pub && pub?.SPK_pub && pub?.SPK_sig) {
-            const trust = await app.pins.verifyPeerPrekeys(peerVeilId, { IK_pub: pub.IK_pub, SPK_pub: pub.SPK_pub, SPK_sig: pub.SPK_sig });
+            // b54: the check also requires the IK-signed PQ prekey — pass it
+            // (device test Oct 18: omitting it revoked every valid ceremony)
+            const trust = await app.pins.verifyPeerPrekeys(peerVeilId, { IK_pub: pub.IK_pub, SPK_pub: pub.SPK_pub, SPK_sig: pub.SPK_sig, pq_pub: pub.pq_pub, pq_sig: pub.pq_sig });
             if (!trust.trusted) {
               myV = false; peerV = false;
+              revokedTokensRef.current.add(token); // Batch G (R5-1-05): sticks across list refreshes
+              persistRevocation(app.sessions, token); // Batch H (R6-1-05): and across restarts; Batch I (V-03): checked + retried
+              sessionVerifiedRef.current[token] = false;
               console.log(`[veil] pin identity mismatch on ${token} — ceremony confirmation revoked (${trust.reason})`);
             }
           }
@@ -3506,7 +4082,7 @@ function VeilApp() {
     setVerifyCard(vcard);
     // b126: fingerprint + pin state travel with the open chat so the
     // verification panel can show them (fingerprint now viewable post-verify).
-    const peerPinned = !!(peerVeilId && (await app.pins.getPin(peerVeilId)));
+    const peerPinned = !!(peerVeilId && pinForChat && sealedPeerMatches(sealedInfo, peerVeilId, pinForChat.ikPubB64));
     setChat({ token, title, subtitle, status, peerVeilId, canNewThread, myVerified: myV, peerVerified: peerV, fingerprint: sealedInfo?.fingerprint ?? null, peerPinned, contact: sessionContactRef.current[token] ?? false,
       ...(groupToken ? { groupToken } : {}),
       ...(burnOn ? { burnAfterOpen: true, burnSeconds: burnSecs || 86400 } : {}) });
@@ -3548,6 +4124,7 @@ function VeilApp() {
     // contentless pings — register token with the relay, zero metadata on the wire
     try {
       Promise.resolve(registerPushToken({
+        invoke: (fn, pl) => app.relay.invoke(fn, pl), // Batch H (R6-3-09): replace this phone’s older rows
         entityCreate: (e, r) => app.relay.entityCreate(e, r),
         entityList: (e, p) => app.relay.entityList(e, p),
         getCached: (k) => app.storage.get(k),
@@ -3565,6 +4142,51 @@ function VeilApp() {
   chatRef.current = chat;
   syncTokenRef.current = syncToken;
   backgroundSyncAllSessionsRef.current = backgroundSyncAllSessions;
+  // b199 CALL SIGNAL POLL (owner report: when one side hangs up the other
+  // stays on the call, shows "Minor interference detected", sometimes
+  // forever). backgroundSyncAllSessions pauses EVERY session during a call
+  // (b196 rate budget) on the assumption the call's own thread is open and
+  // its 1.5s foreground poll carries the signals. A callee who answers from
+  // the list or another thread has no such poll: the caller's ICE and END
+  // signals sit on the relay unread. This polls the call's own session at the
+  // thread cadence for as long as the call lives; backgroundSyncToken skips
+  // itself when that thread is open, so it never doubles the foreground poll.
+  const backgroundSyncTokenRef = useRef(backgroundSyncToken);
+  backgroundSyncTokenRef.current = backgroundSyncToken;
+  // Call quality (20 Oct 2026, owner test: ~5 s from Accept to audio): while a
+  // call is being set up (offer, answer, candidates) the poll runs at
+  // CALL_SETUP_POLL_MS, then drops back to the thread cadence once 'active'.
+  useEffect(() => {
+    let iv: ReturnType<typeof setInterval> | null = null;
+    let current: string | null = null;
+    const unsub = CallManager.subscribe((s) => {
+      const live = s && s.phase !== 'ended' ? s.token : null;
+      const ms = s?.phase === 'active' ? 1500 : CALL_SETUP_POLL_MS;
+      const key = live ? `${live}:${ms}` : null;
+      if (key === current) return;
+      if (iv) { clearInterval(iv); iv = null; }
+      current = key;
+      if (!live) return;
+      const label = s?.peerLabel;
+      console.log(`[veil-call] call poll on for ${live.slice(0, 6)}… (phase ${s?.phase}, every ${ms} ms)`);
+      iv = setInterval(() => { backgroundSyncTokenRef.current(live, label).catch(() => undefined); }, ms);
+    });
+    return () => { unsub(); if (iv) clearInterval(iv); };
+  }, []);
+  // Pixel test Oct 20: with the phone-wide microphone switch off, Android
+  // puts up its own "Unblock microphone?" screen the moment a call's mic
+  // starts. That backgrounds Vardum and the app locked mid-call. The screen
+  // only appears right after a call changes phase, so a short window then is
+  // treated like any other system prompt Vardum opened (see withSystemSheet).
+  useEffect(() => {
+    if (Platform.OS !== 'android') return;
+    let last: string | null = null;
+    return CallManager.subscribe((s) => {
+      const p = s?.phase ?? null;
+      if (p !== last && (p === 'calling' || p === 'connecting' || p === 'active')) expectSystemSheet(15_000);
+      last = p;
+    });
+  }, []);
   // b198: the routers (push + foreground-resume) need the GROUP-aware sync —
   // running the pairwise syncChat against a group session fetched its group
   // envelopes and decrypt-failed them into a false desync banner.
@@ -3610,6 +4232,12 @@ function VeilApp() {
   // Now every non-open session gets checked too.
   useEffect(() => {
     const sub = Notifications.addNotificationReceivedListener(() => {
+      // b199 (owner report: an incoming call showed a burst of "Incoming call"
+      // banners inside the open app and only rang ~7s later): the b196 idle
+      // backoff (up to 60s) also gated push-triggered syncs, so the ping that
+      // says "something new is waiting" was ignored until the backoff ran out.
+      // A push is exactly the evidence the backoff waits for — clear it.
+      pollBackoffRef.current = {};
       // b198: group-aware router (pushes now fire for group messages too —
       // pairwise-syncing the group session here caused the false desync banner).
       if (chatRef.current) syncRouterRef.current(chatRef.current.token);
@@ -3670,8 +4298,12 @@ function VeilApp() {
       }
       setMediaLoad((prev) => ({ ...prev, [msgId]: { loading: false, uri: dataUri, fileUri: fileUri ?? undefined } }));
     } catch (e) {
-      console.error(`[veil] media ${msgId} failed to load: ${(e as Error).message ?? e}`);
-      setMediaLoad((prev) => ({ ...prev, [msgId]: { loading: false, error: String((e as Error).message || e) } }));
+      const why = String((e as Error).message || e);
+      // b199: a 404 means the relay deleted the file (burned/expired) — final, no retry
+      const gone = /(404)/.test(why);
+      if (gone) console.log(`[veil] media ${msgId} is gone from the relay (burned/expired)`);
+      else console.error(`[veil] media ${msgId} failed to load: ${why}`);
+      setMediaLoad((prev) => ({ ...prev, [msgId]: { loading: false, error: gone ? MEDIA_GONE : why } }));
     } finally {
       mediaInFlight.current[msgId] = false;
     }
@@ -3700,11 +4332,25 @@ function VeilApp() {
     try {
       Keyboard.dismiss();
       if (voiceRecRef.current) { try { voiceRecRef.current.stopAndUnloadAsync(); } catch { /* stale */ } voiceRecRef.current = null; }
-      const perm = await Audio.requestPermissionsAsync();
+      const perm = await withSystemSheet(() => Audio.requestPermissionsAsync());
       if (!perm.granted) throw new Error('Microphone permission was not granted.');
       try { await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true }); } catch { /* mode best-effort */ }
-      const rec = new Audio.Recording();
-      await rec.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+      let rec = new Audio.Recording();
+      try {
+        await rec.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+      } catch (prepErr) {
+        // b199 (owner hardware test Oct 16): the first mic use shows iOS's
+        // permission prompt, which backgrounds the app for a moment — prepare
+        // then fails "currently in the background". Wait until the app is
+        // active again and try once more instead of showing an error.
+        if (!/in the background/i.test(String(prepErr))) throw prepErr;
+        for (let i = 0; i < 20 && AppState.currentState !== 'active'; i++) await new Promise((r) => setTimeout(r, 100));
+        await new Promise((r) => setTimeout(r, 300));
+        try { await rec.stopAndUnloadAsync(); } catch { /* never prepared */ }
+        rec = new Audio.Recording();
+        await rec.prepareToRecordAsync(Audio.RecordingOptionsPresets.HIGH_QUALITY);
+      }
+      if (Platform.OS === 'android') expectSystemSheet(15_000); // the same mic-unblock screen (see the call effect)
       await rec.startAsync();
       voiceRecRef.current = rec;
       voiceTickRef.current = setInterval(() => setVoiceRec((r) => ({ ...r, seconds: r.seconds + 1 })), 1000);
@@ -3766,7 +4412,7 @@ function VeilApp() {
         perm = await ImagePicker.getMediaLibraryPermissionsAsync();
         console.log('[veil-media] photo permission:', JSON.stringify(perm));
       } catch { /* permission check is informational only */ }
-      const res = await ImagePicker.launchImageLibraryAsync({
+      const res = await withSystemSheet(() => ImagePicker.launchImageLibraryAsync({
         // b62: images AND videos (site claims video; the send pipeline is
         // mime-generic E2EE bytes, so video needed only picker + render work)
         mediaTypes: ['images', 'videos'] as ImagePicker.MediaType[],
@@ -3774,14 +4420,16 @@ function VeilApp() {
         allowsMultipleSelection: false,
         selectionLimit: 1,
         exif: false,
-      });
+      }));
       const safe: unknown = JSON.parse(JSON.stringify(res, (k, v) => (k === 'base64' ? '[omitted]' : v)));
       console.log('[veil-media] picker result:', JSON.stringify(safe));
       if (res.canceled || !res.assets?.length) {
         // b110: keep raw diagnostics in the console log above (Metro-only);
         // the on-screen banner must never show internal state to the user.
         console.log('[veil-media] empty pick:', JSON.stringify({ canceled: res.canceled, assets: res.assets?.length ?? 0, permission: perm?.status ?? 'unknown' }));
-        setError('No photo or video was selected — tap the attach button to try again.');
+        // b199 (owner hardware test Oct 16): closing the picker on purpose is
+        // not an error — only a pick that came back empty gets the banner.
+        if (!res.canceled) setError('No photo or video was selected — tap the attach button to try again.');
         return;
       }
       const a = res.assets[0];
@@ -3791,7 +4439,35 @@ function VeilApp() {
       }
       console.log('[veil-media] asset ok:', JSON.stringify({ uri: a.uri, name: a.fileName, mime: a.mimeType, size: a.fileSize }));
       Keyboard.dismiss();
-      setPendingPick({ uri: a.uri, name: a.fileName ?? 'media', mime: a.mimeType ?? 'image/jpeg', size: a.fileSize ?? 0 });
+      let pick: PendingPick = { uri: a.uri, name: a.fileName ?? 'media', mime: a.mimeType ?? 'image/jpeg', size: a.fileSize ?? 0 };
+      // b199 (owner hardware test Oct 16: photos "still lag a little"): a
+      // 12 MP camera photo is ~2.5 MB that then gets read, encrypted,
+      // uploaded, downloaded and decrypted. Shrink photos to a 2048 px long
+      // edge first (plenty for a phone screen) — about 4-6x less to move.
+      // Only plain photos: video, GIF (animation) and PNG (transparency) are
+      // sent as they are, and any failure here just sends the original.
+      if (a.type === 'image' && /^image\/(jpe?g|heic|heif)$/i.test(pick.mime) && Math.max(a.width || 0, a.height || 0) > MEDIA_PHOTO_MAX_EDGE) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const IM = require('expo-image-manipulator') as typeof import('expo-image-manipulator');
+          const scale = MEDIA_PHOTO_MAX_EDGE / Math.max(a.width, a.height);
+          const t0 = Date.now();
+          const out = await IM.manipulateAsync(
+            a.uri,
+            [{ resize: { width: Math.round(a.width * scale), height: Math.round(a.height * scale) } }],
+            { format: IM.SaveFormat.JPEG, compress: 0.8 },
+          );
+          const info = await FileSystem.getInfoAsync(out.uri);
+          const size = info.exists ? (info as { size?: number }).size ?? 0 : 0;
+          if (size > 0 && (!pick.size || size < pick.size)) {
+            pick = { uri: out.uri, name: pick.name.replace(/\.(heic|heif|jpe?g)$/i, '') + '.jpg', mime: 'image/jpeg', size };
+          }
+          console.log(`[veil-media] photo shrunk ${a.width}x${a.height} ${a.fileSize ?? '?'}B -> ${out.width}x${out.height} ${size}B in ${Date.now() - t0} ms`);
+        } catch (e) {
+          console.log('[veil-media] shrink skipped, sending original:', String(e));
+        }
+      }
+      setPendingPick(pick);
       console.log('[veil-media] pendingPick SET — preview modal should now be visible');
     } catch (e) {
       const msg = `${(e as Error).message ?? e}`;
@@ -3819,7 +4495,7 @@ function VeilApp() {
       // b92 F14 (b91 audit): full Photos access (NOT write-only) so the
       // duress purge can delete what the app saves — write-only saves
       // survived a duress wipe.
-      const perm = await MediaLibrary.requestPermissionsAsync(false);
+      const perm = await withSystemSheet(() => MediaLibrary.requestPermissionsAsync(false));
       if (!perm.granted) throw new Error('Photos permission was not granted.');
       const b64 = dataUri.slice(dataUri.indexOf(',') + 1);
       const mime = orig.media.mime || 'image/jpeg';
@@ -3849,7 +4525,7 @@ function VeilApp() {
     try {
       if (chat.groupToken) {
         const b64g = await FileSystem.readAsStringAsync(pendingPick.uri, { encoding: FileSystem.EncodingType.Base64 });
-        const bytesG = Uint8Array.from(atob(b64g), (c) => c.charCodeAt(0));
+        const bytesG = fromB64(b64g);
         const sizeG = pendingPick.size || bytesG.byteLength;
         if (sizeG > MEDIA_LIMIT_BYTES) throw new Error('Media is limited to 100 MB per message.');
         const r = await sendGroupMediaMessage(
@@ -3878,7 +4554,7 @@ function VeilApp() {
       const ready = await advanceHandshake(chat.token, who);
       if (!ready) throw new Error('Waiting for your contact to accept — messaging unlocks the moment they join.');
       const b64 = await FileSystem.readAsStringAsync(pendingPick.uri, { encoding: FileSystem.EncodingType.Base64 });
-      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const bytes = fromB64(b64);
       const size = pendingPick.size || bytes.byteLength;
       if (size > MEDIA_LIMIT_BYTES) throw new Error('Media is limited to 100 MB per message.');
       // RN networking: upload the CIPHERTEXT as a cache-file FormData part (the
@@ -3987,6 +4663,7 @@ function VeilApp() {
           }
           const ready = await advanceHandshakeRef.current(token, who);
           if (!ready) { console.log('[veil-capture] notice skipped: handshake not ready (pending thread)'); return; }
+          if (!sessionVerifiedRef.current[token]) { console.log('[veil-capture] notice skipped: safety codes not confirmed'); return; } // Batch G (R5-1-08)
           const msg = await sendChatMessage(app.relay, app.sessions, token, who, text);
           setChatMessages((prev) => [...prev, msg]);
           setChatKnown((prev) => new Set([...prev, msg.id]));
@@ -4005,6 +4682,57 @@ function VeilApp() {
     return () => { stop?.(); };
   }, [app]);
 
+  // b199 REACTIONS (owner request, Oct 17): hold a message, tap an emoji.
+  // Pairwise threads only for now (groups/forum have no per-message ids the
+  // other members share in this form). Tapping your current reaction
+  // removes it. Optimistic: the bubble updates at once, the cache persists
+  // it, and the encrypted reaction goes out; on failure the bubble reverts.
+  const handleReact = useCallback(async (msgId: string, emoji: string) => {
+    if (!app || !chat || chat.groupToken || chat.lounge || chat.forum) return;
+    if (!(chat.myVerified && chat.peerVerified)) return; // Batch F (R4-4-16): the safety-code gate
+    const msg = chatMessages.find((m) => m.id === msgId);
+    if (!msg) return;
+    const target = msg.mine ? msg.envId : msg.id;
+    if (!target) { console.log('[veil-react] skipped: my message has no relay id yet'); return; }
+    const prev = msg.reactions?.mine ?? null;
+    const next = prev === emoji ? null : emoji;
+    const token = chat.token;
+    const apply = (e: string | null) => setChatMessages((list) => list.map((m) => {
+      if (m.id !== msgId) return m;
+      const reactions = { ...(m.reactions ?? {}) };
+      if (e) reactions.mine = e; else delete reactions.mine;
+      return { ...m, reactions };
+    }));
+    apply(next);
+    try {
+      const who = await clientId();
+      if (!who) throw new Error('not signed in');
+      await sendReaction(app.relay, app.sessions, token, who, target, next);
+      await app.sessions.setCachedReaction(token, msgId, 'mine', next).catch(() => undefined);
+      console.log(`[veil-react] sent ${next ?? '(removed)'} on ${target.slice(0, 8)}…`);
+    } catch (e) {
+      console.log(`[veil-react] send failed: ${(e as Error)?.message ?? e}`);
+      apply(prev);
+    }
+  }, [app, chat, chatMessages]);
+
+  /** b199: apply the peer's reactions from a sync pass — live thread + cache */
+  const applyPeerReactions = useCallback(async (token: string, list: { target: string; emoji: string | null }[] | undefined) => {
+    if (!app || !list?.length) return;
+    console.log(`[veil-react] peer reaction update(s): ${list.length}`);
+    for (const r of list) await app.sessions.setCachedReaction(token, r.target, 'peer', r.emoji).catch(() => undefined);
+    if (chatRef.current?.token !== token) return;
+    setChatMessages((msgs) => msgs.map((m) => {
+      const hits = list.filter((r) => r.target === m.id || (!!m.envId && r.target === m.envId));
+      if (!hits.length) return m;
+      const e = hits[hits.length - 1].emoji;
+      const reactions = { ...(m.reactions ?? {}) };
+      if (e) reactions.peer = e; else delete reactions.peer;
+      return { ...m, reactions };
+    }));
+  }, [app]);
+  applyPeerReactionsRef.current = applyPeerReactions;
+
   const handleSend = useCallback(async () => {
     if (!app || !chat || !draft.trim()) return;
     // b187: read-only lounge threads — composer locked; enforced gate.
@@ -4017,7 +4745,7 @@ function VeilApp() {
       try {
         await sendForumMessage(
           { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
-          { groupToken: chat.groupToken, clientId: whoF, text: draft.trim() },
+          { groupToken: chat.groupToken, clientId: whoF, text: userText(draft.trim()) }, // Batch E (F-14)
         );
         const now = new Date().toISOString();
         const mineF: (ChatMessage & { sender?: string }) = { id: `local_${Date.now()}`, text: draft.trim(), mine: true, ts: now, sender: 'You' };
@@ -4045,7 +4773,7 @@ function VeilApp() {
       if (chat.groupToken) {
         await sendGroupMessage(
           { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
-          { groupToken: chat.groupToken, sessionToken: chat.token, clientId: who, text: draft.trim() },
+          { groupToken: chat.groupToken, sessionToken: chat.token, clientId: who, text: userText(draft.trim()) }, // Batch E (F-14)
         );
         const now = new Date().toISOString();
         const mineMsg: (ChatMessage & { sender?: string }) = { id: `local_${Date.now()}`, text: draft.trim(), mine: true, ts: now, sender: 'You' }; // b198: own group sends get no send-time burn clock — anchors at receipt
@@ -4061,7 +4789,7 @@ function VeilApp() {
       }
       const ready = await advanceHandshake(chat.token, who);
       if (!ready) throw new Error('Waiting for your contact to accept — messaging unlocks the moment they join.');
-      const msg = await sendChatMessage(app.relay, app.sessions, chat.token, who, draft.trim());
+      const msg = await sendChatMessage(app.relay, app.sessions, chat.token, who, userText(draft.trim())); // Batch E (F-14)
       setChatMessages((prev) => [...prev, msg]);
       setChatKnown((prev) => new Set([...prev, msg.id]));
       setDraft('');
@@ -4074,34 +4802,244 @@ function VeilApp() {
   }, [app, chat, draft, syncToken, syncGroupToken, advanceHandshake]);
 
   // b62 groups: create + admin (creator-only rotate / evict)
-  const handleCreateGroup = useCallback(async (groupName: string, inviteCount: number): Promise<{ groupName: string; inviteLinks: string[] }> => {
-    if (!app || !identity) throw new Error('Create your Veil identity first — Settings → Identity.');
+  /**
+   * b199 (owner request, Oct 16 2026): deliver a private payload into the
+   * encrypted 1:1 chat with a pinned contact. Reuses the live chat with them
+   * when one exists — starting a fresh one-tap session would supersede it
+   * (K-17) — otherwise starts one quietly without opening it here.
+   */
+  const sendToContact = useCallback(async (veilId: string, text: string): Promise<'sent' | 'queued'> => {
+    if (!app || !identity) throw new Error('Create your Vardum identity first.');
+    const session = await app.auth.currentSession();
+    if (!session) throw new Error('Not signed in.');
+    const who = await clientId();
+    if (!who) throw new Error('Sign in first.');
+    let token: string | null = null;
+    // Batch F (round-4 review R4-1-04, High): this chat carries the group key. The
+    // relay list only supplies CANDIDATES (newest first); the chat is chosen from
+    // this phone's sealed state: a contact chat whose sealed peer is this contact
+    // under its pinned key. The relay can't relabel another chat into the choice.
+    const pin = await app.pins.getPin(veilId);
+    try {
+      const lst = await app.relay.sessionList(session.user.id, identity.veilId);
+      const raw = (lst.data as { data?: unknown[] })?.data ?? (lst.data as unknown as { sessions?: unknown[] })?.sessions ?? [];
+      const candidates = ((Array.isArray(raw) ? raw : []) as Record<string, unknown>[])
+        .filter((rec) => !!rec.token && !rec.group_token && String(rec.state ?? '') !== 'ended')
+        .sort((a, b) => String(b.created_date ?? '').localeCompare(String(a.created_date ?? '')))
+        .map((rec) => String(rec.token));
+      if (pin) token = await pickContactSession(app.sessions, candidates, veilId, pin.ikPubB64);
+    } catch { /* list failure → start a fresh chat below */ }
+    if (!token) {
+      const created = await createOneTapSession(
+        { relay: app.relay, pins: app.pins, sessions: app.sessions }, identity, veilId, session.user.id,
+        {
+          default_ttl_seconds: settingsRef.current.burnTtlSeconds,
+          expire_after_seconds: settingsRef.current.expireAfterSeconds,
+          key_retention_hours: settingsRef.current.retentionHours,
+          burn_after_open: settingsRef.current.burnTtlSeconds > 0,
+        },
+        settingsRef.current.nickname || undefined,
+      );
+      token = created.token;
+    }
+    // b199 (owner hardware repro, Oct 16): a freshly started contact chat is
+    // not usable until the other phone accepts it ("Session keys not
+    // established") — the invite used to be lost there. Queue it on this
+    // chat instead; flushPendingInvites sends it the moment the chat is ready.
+    const st = await app.sessions.load(token) as { ready?: boolean } | null;
+    // Batch E (Superagent round 3, N3-1): a group invite carries the group key, so it
+    // waits for the same gate as typed messages — both safety codes confirmed
+    if (!st?.ready || !sessionVerifiedRef.current[token]) {
+      await enqueueInvite({ veilId, token, text, at: Date.now() });
+      return 'queued';
+    }
+    await sendChatMessage(app.relay, app.sessions, token, who, text);
+    return 'sent';
+  }, [app, identity]);
+
+  /** b199: invites waiting for a contact to accept the chat that carries them.
+   *  Persisted (Keychain) so a restart never loses one; flushed every few seconds. */
+  const PENDING_INVITES_KEY = 'veil_pending_group_invites_v1';
+  type PendingInvite = { veilId: string; token: string; text: string; at: number };
+  const readPendingInvites = async (): Promise<PendingInvite[]> => {
+    try { const raw = await app?.storage.get(PENDING_INVITES_KEY); return raw ? (JSON.parse(raw) as PendingInvite[]) : []; } catch { return []; }
+  };
+  const writePendingInvites = async (list: PendingInvite[]) => {
+    try { await app?.storage.set(PENDING_INVITES_KEY, JSON.stringify(list)); } catch { /* retried next pass */ }
+  };
+  const enqueueInvite = async (p: PendingInvite) => {
+    const list = (await readPendingInvites()).filter((x) => !(x.token === p.token && x.text === p.text));
+    list.push(p);
+    await writePendingInvites(list);
+    console.log(`[veil-group-invite] queued for ${p.veilId.slice(0, 8)}… until they accept the chat`);
+  };
+  const flushingInvitesRef = useRef(false);
+  useEffect(() => {
+    if (!app || !identity) return;
+    const WEEK = 7 * 86400_000;
+    const iv = setInterval(() => {
+      if (flushingInvitesRef.current) return;
+      flushingInvitesRef.current = true;
+      (async () => {
+        const list = await readPendingInvites();
+        if (!list.length) return;
+        const who = await clientId();
+        if (!who) return;
+        const keep: PendingInvite[] = [];
+        for (const p of list) {
+          if (Date.now() - p.at > WEEK) { console.log(`[veil-group-invite] dropped stale invite for ${p.veilId.slice(0, 8)}… (not accepted within 7 days)`); continue; }
+          const st = await app.sessions.load(p.token).catch(() => null) as { ready?: boolean } | null;
+          if (!st) { console.log(`[veil-group-invite] chat for ${p.veilId.slice(0, 8)}… is gone — invite dropped; add them again`); continue; }
+          // Batch F (R4-1-04): the queued chat must still be a contact chat with this
+          // contact under its pinned key (sealed state), or the invite is dropped
+          const flushPin = await app.pins.getPin(p.veilId);
+          if (!flushPin || !sealedPeerMatches(st, p.veilId, flushPin.ikPubB64)) { console.log(`[veil-group-invite] chat for ${p.veilId.slice(0, 8)}… no longer matches the contact — invite dropped; add them again`); continue; }
+          if (!st.ready || !sessionVerifiedRef.current[p.token]) { keep.push(p); continue; } // Batch E (N3-1): safety codes first
+          try {
+            await sendChatMessage(app.relay, app.sessions, p.token, who, p.text);
+            console.log(`[veil-group-invite] delivered queued invite to ${p.veilId.slice(0, 8)}…`);
+          } catch (e) {
+            console.log(`[veil-group-invite] queued send retry later: ${String((e as Error)?.message ?? e)}`);
+            keep.push(p);
+          }
+        }
+        await writePendingInvites(keep);
+      })().catch(() => undefined).finally(() => { flushingInvitesRef.current = false; });
+    }, 5000);
+    return () => clearInterval(iv);
+  }, [app, identity]);
+
+  /** b199: the group dials every new seat rides (b92 F-S6: never a hard-coded burn) */
+  const groupDials = useCallback(() => ({
+    burnAfterOpen: settingsRef.current.burnTtlSeconds > 0,
+    expireAfterSeconds: settingsRef.current.expireAfterSeconds,
+    keyRetentionHours: settingsRef.current.retentionHours,
+    defaultTtlSeconds: settingsRef.current.burnTtlSeconds,
+  }), []);
+
+  /** b199: send each contact their locked seat, privately, inside your 1:1 chat */
+  const deliverGroupInvites = useCallback(async (groupName: string, invites: { veilId: string; link: string }[]) => {
+    const invited: string[] = []; const queued: string[] = []; const failed: string[] = [];
+    for (const inv of invites) {
+      try {
+        const r = await sendToContact(inv.veilId, buildGroupInvitePayload({ name: groupName, link: inv.link, from: identity?.veilId }));
+        (r === 'sent' ? invited : queued).push(inv.veilId);
+      } catch (e) {
+        console.log(`[veil-group-invite] delivery to ${inv.veilId.slice(0, 8)}… failed: ${String((e as Error)?.message ?? e)}`);
+        failed.push(inv.veilId);
+      }
+    }
+    return { invited, queued, failed };
+  }, [sendToContact, identity]);
+
+  const handleCreateGroup = useCallback(async (groupName: string, invitees: string[], linkCount: number): Promise<GroupInviteResult> => {
+    if (!app || !identity) throw new Error('Create your Vardum identity first — Settings → Identity.');
     const who = await clientId();
     if (!who) throw new Error('Sign in first.');
     const name = groupName.trim().slice(0, 40);
     if (!name) throw new Error('Give the group a name.');
-    const n = Math.max(1, Math.min(inviteCount, GROUP_MEMBER_CAP - 1));
+    const people = [...new Set(invitees)].slice(0, GROUP_MEMBER_CAP - 1);
+    const links = Math.max(0, Math.min(linkCount, GROUP_MEMBER_CAP - 1 - people.length));
+    if (people.length + links === 0) throw new Error('Choose at least one person, or add an invite link.');
     const created = await createGroup(
       { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
       {
         identity: { veilId: identity.veilId, ikSeedB64: identity.ikSeedB64, ikPubB64: identity.ikPubB64, pqPrivB64: identity.pqPrivB64 },
         groupName: name,
-        inviteCount: n,
+        inviteCount: links,
+        invitees: people,
         clientId: who,
-        dials: {
-          burnAfterOpen: settings.burnTtlSeconds > 0,
-          expireAfterSeconds: settings.expireAfterSeconds,
-          keyRetentionHours: settings.retentionHours,
-          // b92 F-S6 (settings sweep, live-confirmed on relay rows created
-          // 20:55 Sept 20): was hardcoded 3600 — the burn dial silently
-          // became a 1-hour burn window on every invite-link + group thread.
-          defaultTtlSeconds: settings.burnTtlSeconds,
-        },
+        dials: groupDials(),
       },
     );
-    await refreshSessions();
-    return { groupName: created.groupName, inviteLinks: created.inviteLinks };
-  }, [app, identity, settings.burnTtlSeconds, settings.expireAfterSeconds, settings.retentionHours, refreshSessions]);
+    const { invited, queued, failed } = await deliverGroupInvites(created.groupName, created.contactInvites);
+    await refreshSessions(true); // b199: user action, not ambient — never skipped by the burn hold
+    refreshMyGroups();
+    return { groupName: created.groupName, inviteLinks: created.inviteLinks, invited, queued, failed };
+  }, [app, identity, groupDials, deliverGroupInvites, refreshSessions]);
+
+  /** b199 "Add people" — creator only, seats minted at the group's current epoch */
+  const handleAddGroupPeople = useCallback(async (groupToken: string, invitees: string[], linkCount: number): Promise<GroupInviteResult> => {
+    if (!app || !identity) throw new Error('Create your Vardum identity first.');
+    const who = await clientId();
+    if (!who) throw new Error('Sign in first.');
+    if (invitees.length + linkCount === 0) throw new Error('Choose at least one person, or add an invite link.');
+    const seats = await createGroupSeats(
+      { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
+      { groupToken, clientId: who, dials: groupDials(), invitees, linkCount },
+    );
+    const { invited, queued, failed } = await deliverGroupInvites(seats.groupName, seats.contactInvites);
+    return { groupName: seats.groupName, inviteLinks: seats.inviteLinks, invited, queued, failed };
+  }, [app, identity, groupDials, deliverGroupInvites]);
+
+  /** b199: groups this device created — the only ones it can add people to */
+  const [myGroups, setMyGroups] = useState<{ groupToken: string; name: string }[]>([]);
+  const refreshMyGroups = useCallback(() => {
+    if (!app) return;
+    (async () => {
+      const out: { groupToken: string; name: string }[] = [];
+      for (const gt of listGroupTokens(app.storage)) {
+        const rec = await loadGroupRecord(app.storage, gt).catch(() => null);
+        if (rec && rec.role === 'creator') out.push({ groupToken: gt, name: rec.name || 'Unnamed group' });
+      }
+      setMyGroups(out);
+    })().catch(() => undefined);
+  }, [app]);
+  useEffect(() => { refreshMyGroups(); }, [refreshMyGroups, sessionRows.length]);
+
+  /**
+   * b199 (owner decision, Oct 16 2026): Contacts NEVER starts a chat silently.
+   * Tapping a contact opens your existing contact chat with them. When there
+   * is none, this returns the choices instead — your anonymous (invite-link)
+   * chats, which carry no Veil ID and so can't be matched to a contact — and
+   * the screen asks: open one of those, or start a new chat. A new chat is
+   * started only on that explicit choice (`choice.start`).
+   */
+  const handleOpenContact = useCallback(async (
+    veilId: string,
+    choice?: { open?: string; start?: boolean },
+  ): Promise<ContactChatChoice[] | null> => {
+    const openRow = async (r: SessionRow) => {
+      await openChat(r.token, r.title, r.subtitle, r.status, r.peerVeilId ?? null, !!r.myVerified, !!r.peerVerified);
+    };
+    if (choice?.open) {
+      const r = sessionRows.find((x) => x.token === choice.open);
+      if (r) await openRow(r);
+      return null;
+    }
+    if (choice?.start) { await handleMessage(veilId); return null; }
+    // Batch F (R4-4-01): open a chat with this contact only if this phone sealed
+    // it as being with them under their pinned key; the row's label never decides
+    const pinC = app ? await app.pins.getPin(veilId) : null;
+    const withThem = pinC && app
+      ? await pickContactSession(app.sessions, sessionRows.filter((r) => !r.groupToken && r.status !== 'ended').map((r) => r.token), veilId, pinC.ikPubB64)
+      : null;
+    const mineWithThem = withThem ? sessionRows.find((r) => r.token === withThem) : undefined;
+    if (mineWithThem) { await openRow(mineWithThem); return null; }
+    return sessionRows
+      .filter((r) => !r.groupToken && !r.lounge && !r.forum && r.status !== 'ended' && !r.peerVeilId)
+      .map((r) => ({ token: r.token, title: r.title, subtitle: r.subtitle }));
+  }, [app, sessionRows, openChat, handleMessage]);
+
+  /** b199: Join / Decline on a group invite card (state kept on this phone) */
+  const INVITE_STATE_KEY = 'veil_group_invite_state_v1';
+  const [inviteState, setInviteState] = useState<Record<string, 'joined' | 'declined'>>({});
+  useEffect(() => {
+    if (!app) return;
+    app.storage.get(INVITE_STATE_KEY).then((raw) => { try { setInviteState(raw ? JSON.parse(raw) : {}); } catch { /* fresh */ } }).catch(() => undefined);
+  }, [app]);
+  const markInvite = useCallback(async (msgId: string, s: 'joined' | 'declined') => {
+    setInviteState((cur) => {
+      const next = { ...cur, [msgId]: s };
+      app?.storage.set(INVITE_STATE_KEY, JSON.stringify(next)).catch(() => undefined);
+      return next;
+    });
+  }, [app]);
+  const handleJoinGroupInvite = useCallback(async (msgId: string, link: string) => {
+    await handleJoinInvite(link);
+    await markInvite(msgId, 'joined');
+  }, [handleJoinInvite, markInvite]);
+  const handleDeclineGroupInvite = useCallback(async (msgId: string) => { await markInvite(msgId, 'declined'); }, [markInvite]);
 
   const groupMainSession = useCallback(async (): Promise<string> => {
     if (!app || !chat?.groupToken) throw new Error('No group open.');
@@ -4141,23 +5079,48 @@ function VeilApp() {
       const main = await groupMainSession();
       const who = await clientId();
       if (!who) return;
-      await evictGroupMember(
+      // Batch F (round-4 review R4-2-01): in the forum, "Remove" never touches the
+      // keys (a rotation breaks the forum). It blocks the member on this phone and
+      // removes their posts that are on screen, for everyone (founder removal).
+      if (chat?.forum || (FORUM_PIN && chat.groupToken === FORUM_PIN.groupToken)) {
+        if (FORUM_PIN && member.veilId === FORUM_PIN.founderVeilId) return;
+        const theirs = chatMessages.filter((m) => !m.mine && m.senderVid === member.veilId);
+        const envIds = [...new Set(theirs.map((m) => m.envId ?? m.id).filter(Boolean) as string[])];
+        if (envIds.length) {
+          // Batch G (round-5 review R5-2-04): one removal post per 20 posts (a removal
+          // post names at most 20), so every post really goes for everyone
+          for (let k = 0; k < envIds.length; k += 20) {
+            await sendGroupMessage(
+              { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
+              { groupToken: chat.groupToken, sessionToken: chat.token, clientId: who, text: buildRemoveText(envIds.slice(k, k + 20)) },
+            );
+          }
+          for (const id of envIds) { try { await app.relay.entityDelete('VeilEnvelope', id); } catch { /* relay copy: best-effort */ } }
+          const gone = new Set([...envIds, ...theirs.map((m) => m.id)]);
+          setChatMessages((prev) => prev.filter((m) => !gone.has(m.id) && !(m.envId && gone.has(m.envId))));
+          app.sessions.removeCachedMessages(chat.token, [...gone]).catch(() => undefined);
+        }
+        setBlockedIds(await blockVeilId(app.storage, member.veilId));
+        // Batch G (R5-3-01): also take their seat away on the relay (founder only, no key change)
+        // Batch H (round-6 review R6-2-08): and say whether that worked
+        const seatFreed = await removeForumMember({ relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL }, { groupToken: chat.groupToken, sessionToken: main, target: member })
+          .then(() => true, (e) => { console.log('[veil-ugc] forum seat not removed:', String((e as Error)?.message ?? e)); return false; });
+        setChatMessages((prev) => [...prev, { id: `sys_forumremove_${Date.now()}`, text: '', mine: false, ts: new Date().toISOString(), systemNote: `Blocked on this phone${envIds.length ? ` and ${envIds.length} post(s) removed for everyone` : ''}. ${seatFreed ? 'Their forum seat was freed, and their account can\u2019t rejoin.' : 'Their forum seat could not be freed. Try again in a moment.'} The forum's keys were not changed.` }]);
+        return;
+      }
+      // Batch C (A3): eviction + rotation are one operation; if the rotation
+      // fails, normal sends stay blocked and the next poll finishes it
+      const newEpoch = await evictGroupMember(
         { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
-        { groupToken: chat.groupToken, sessionToken: main, target: member },
+        { groupToken: chat.groupToken, sessionToken: main, target: member, clientId: who },
       );
-      // web parity: eviction is followed immediately by a key rotation so the
-      // evicted member cannot read future messages
-      const newEpoch = await rotateGroup(
-        { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
-        { groupToken: chat.groupToken, sessionToken: main, clientId: who },
-      );
-      setGroupInfo((gi) => (gi ? { ...gi, epoch: newEpoch } : gi));
+      if (newEpoch !== null) setGroupInfo((gi) => (gi ? { ...gi, epoch: newEpoch } : gi));
       setChatMessages((prev) => [...prev, { id: `sys_evict_${Date.now()}`, text: '', mine: false, ts: new Date().toISOString(), systemNote: 'A member was removed and the group keys rotated.' }]);
     } catch (e) {
       setError(friendlyError(e, 'action'));
       throw e;
     } finally { setGroupBusy(false); }
-  }, [app, chat, groupMainSession]);
+  }, [app, chat, chatMessages, groupMainSession]);
 
   const handleEndSession = useCallback(async () => {
     if (!app || !chat) return;
@@ -4242,6 +5205,13 @@ function VeilApp() {
         // tied to the group, then hide any survivor (peer-owned rows a
         // credential can't reach, b65 class) so nothing resurrects.
         const groupTokens = new Set<string>([chat.token]);
+        // Batch F (round-4 review R4-4-07): the server's group tag only NOMINATES a
+        // row. A row is ended and wiped only if the local group record knows its
+        // token (my seat or seats I made), or this phone holds no keys for it, so a
+        // 1:1 chat the server tagged with this group is never swept up.
+        const gRec = await loadGroupRecord(app.storage, chat.groupToken).catch(() => null);
+        const groupOwnTokens = new Set<string>([chat.token, ...(gRec?.seatToken ? [gRec.seatToken] : []), ...Object.keys(gRec?.seats ?? {})]);
+        const hideOnly: string[] = [];
         try {
           const r = await app.relay.sessionList(who ?? '');
           const list = (r.data as { data?: unknown[] })?.data ?? (r.data as unknown as { sessions?: unknown[] })?.sessions ?? (r.data as unknown[]);
@@ -4249,11 +5219,15 @@ function VeilApp() {
             const rec = raw as Record<string, unknown>;
             if (rec.group_token && String(rec.group_token) === chat.groupToken) {
               const t = String(rec.token ?? '');
-              if (t) groupTokens.add(t);
+              // Batch G (round-5 review R5-2-07): only the group's own tokens are ended and
+              // wiped. Other rows the server tagged with this group are only hidden here,
+              // and a read error never counts as "no keys".
+              if (t && groupOwnTokens.has(t)) groupTokens.add(t);
+              else if (t) hideOnly.push(t);
             }
           }
         } catch { /* list failure → end just the open token, as before */ }
-        const survivors: string[] = [];
+        const survivors: string[] = [...hideOnly];
         for (const t of groupTokens) {
           let ended = true;
           try { await app.relay.sessionEnd(t, (await app.sessions.load(t))?.writeSecret ?? null, who); }
@@ -4317,6 +5291,73 @@ function VeilApp() {
     } finally { setBusy(false); }
   }, [app, chat, refreshSessions]);
 
+  // ---------- Play UGC (18 Oct 2026): report / block / founder removal ----------
+  const isForumFounderThread = !!(chat?.groupToken && FORUM_PIN && identity
+    && chat.groupToken === FORUM_PIN.groupToken && identity.veilId === FORUM_PIN.founderVeilId && !chat.forum);
+
+  /** tester: report a forum post to the founder (sealed to the founder's key) */
+  const handleReportMessage = useCallback(async (msgId: string, reason: string) => {
+    if (!app || !chat?.forum || !chat.groupToken) return;
+    const msg = chatMessages.find((m) => m.id === msgId);
+    if (!msg) return;
+    const who = await clientId();
+    if (!who) throw new Error('Sign in again, then try once more.');
+    await sendForumReport(
+      { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
+      { groupToken: chat.groupToken, clientId: who, post: { envelopeId: msg.envId ?? msg.id, senderVeilId: msg.senderVid ?? null, text: msg.media ? `[${msg.media.name ?? 'media'}]` : msg.text }, reason },
+    );
+    console.log('[veil-ugc] report sent to the forum founder');
+  }, [app, chat, chatMessages]);
+
+  /** block the sender of a group / forum message (device-local) */
+  const handleBlockSender = useCallback(async (msgId: string) => {
+    if (!app) return;
+    const vid = chatMessages.find((m) => m.id === msgId)?.senderVid;
+    if (!vid) throw new Error('This message doesn’t carry its sender’s Vardum ID (it arrived before blocking existed). Block them from a newer message.');
+    if (FORUM_PIN && vid === FORUM_PIN.founderVeilId && chat?.forum) throw new Error('The founder runs the forum and can’t be blocked here. To stop seeing the forum, leave it from the ⋯ menu.');
+    setBlockedIds(await blockVeilId(app.storage, vid));
+    console.log('[veil-ugc] sender blocked on this device');
+  }, [app, chat, chatMessages]);
+
+  /** forum founder: remove a post for everyone — a founder-signed removal post
+   *  (every phone drops it) plus the relay copy (founder-only delete) */
+  const handleRemoveMessage = useCallback(async (msgId: string) => {
+    if (!app || !chat?.groupToken || !isForumFounderThread) return;
+    const msg = chatMessages.find((m) => m.id === msgId);
+    const envId = msg?.envId ?? msg?.id;
+    if (!envId) return;
+    const who = await clientId();
+    if (!who) throw new Error('Sign in again, then try once more.');
+    await sendGroupMessage(
+      { relay: app.relay, sessions: app.sessions, storage: app.storage, webBaseUrl: VEIL_BASE_URL },
+      { groupToken: chat.groupToken, sessionToken: chat.token, clientId: who, text: buildRemoveText([envId]) },
+    );
+    try { await app.relay.entityDelete('VeilEnvelope', envId); } catch (e) {
+      console.log('[veil-ugc] relay copy not deleted (relay without the founder rule?):', String((e as Error)?.message ?? e));
+    }
+    setChatMessages((prev) => prev.filter((m) => m.id !== msgId && m.envId !== envId));
+    app.sessions.removeCachedMessages(chat.token, [msgId, envId]).catch(() => undefined);
+    console.log('[veil-ugc] post removed for everyone');
+  }, [app, chat, chatMessages, isForumFounderThread]);
+
+  /** 1:1: block this contact — ends the chat on both sides (so they can't keep
+   *  sending or pinging), hides their threads and requests on this phone */
+  const handleBlockContact = useCallback(async () => {
+    if (!app || !chat || chat.groupToken) return;
+    // Batch G (round-5 review R5-1-04): block the identity this phone sealed for the
+    // chat; an invite chat only ends (its label came from the server)
+    const sp = sealedPeer(await app.sessions.load(chat.token).catch(() => null));
+    if (sp) setBlockedIds(await blockVeilId(app.storage, sp.veilId));
+    else Alert.alert('Chat ended', 'This chat isn’t linked to a saved contact, so it was ended without blocking a Vardum ID.');
+    await handleEndSession();
+  }, [app, chat, handleEndSession]);
+
+  const handleUnblock = useCallback(async (veilId: string) => {
+    if (!app) return;
+    setBlockedIds(await unblockVeilId(app.storage, veilId));
+    refreshSessions();
+  }, [app, refreshSessions]);
+
   if (locked && (identity || appLock)) {
     return (
       <LockScreen
@@ -4335,7 +5376,7 @@ function VeilApp() {
   if (bootError) {
     return (
       <View style={styles.boot}>
-        <Text style={styles.errTitle}>VEIL could not start</Text>
+        <Text style={styles.errTitle}>Vardum could not start</Text>
         <Text style={styles.errText}>{bootError}</Text>
         {/* b104: every fatal-screen screenshot must self-identify the JS
             build it ran on — the owner's crash screenshot was visually
@@ -4351,7 +5392,7 @@ function VeilApp() {
   if (screen === 'boot' || !app) {
     return (
       <View style={styles.boot}>
-        <ActivityIndicator color="#5fd4c4" />
+        <ActivityIndicator color="#FFFFFF" />
         <Text style={styles.bootText}>Sealing the device…</Text>
       </View>
     );
@@ -4410,7 +5451,9 @@ function VeilApp() {
         onRestore={handleRestore}
         onFinishCreate={handleFinishCreate}
         onSignOut={handleSignOut}
-        onAccountSignIn={() => setScreen('login')}
+        /* b199 (owner, Oct 16): no email sign-in link on the first screen. Older
+           email-based identities still get in: restoring with their 24 words
+           falls back to the email sign-in automatically (handleRestore). */
         initialMode={identityEntry}
       />
       <CallOverlay />
@@ -4420,8 +5463,9 @@ function VeilApp() {
 
   if (screen === 'chat' && chat) {
     // combine the device messages with the media decrypt cache for the UI
-    const uiMessages: ChatMessageUI[] = chatMessages.map((m) => {
-      if (!m.media) return { id: m.id, text: m.text, mine: m.mine, ts: m.ts, sender: m.sender, senderVerified: m.senderVerified, systemNote: m.systemNote, openedAt: m.openedAt, read: m.read };
+    // Play UGC: blocked senders' rows are never rendered (they stay cached, so unblocking shows them again)
+    const uiMessages: ChatMessageUI[] = (blockListLoaded || !chat.groupToken ? withoutBlocked(chatMessages, blockedIds) : chatMessages.filter((m) => m.mine || !!(m as { systemNote?: string }).systemNote)).map((m) => {
+      if (!m.media) return { id: m.id, text: m.text, mine: m.mine, ts: m.ts, sender: m.sender, senderVerified: m.senderVerified, systemNote: m.systemNote, openedAt: m.openedAt, read: m.read, groupInvite: m.groupInvite, reactions: m.reactions };
       const st = mediaLoad[m.id];
       const mime = m.media.mime ?? 'application/octet-stream';
       const isAv = mime.startsWith('audio/') || mime.startsWith('video/');
@@ -4430,7 +5474,7 @@ function VeilApp() {
       let src = st?.uri ?? (m.mine ? m.media.localUri ?? null : null);
       if (isAv) src = st?.fileUri ?? st?.uri ?? (m.mine ? m.media.localUri ?? null : null);
       return {
-        id: m.id, text: m.text, mine: m.mine, ts: m.ts, sender: m.sender, senderVerified: m.senderVerified, systemNote: m.systemNote, openedAt: m.openedAt, read: m.read,
+        id: m.id, text: m.text, mine: m.mine, ts: m.ts, sender: m.sender, senderVerified: m.senderVerified, systemNote: m.systemNote, openedAt: m.openedAt, read: m.read, reactions: m.reactions,
         media: {
           name: m.media.name ?? 'media',
           mime,
@@ -4465,8 +5509,13 @@ function VeilApp() {
         draft={draft}
         onDraftChange={setDraft}
         onSend={handleSend}
+        onReactMessage={!chat.groupToken && !chat.lounge && !chat.forum ? handleReact : undefined}
+        onReportMessage={chat.forum ? handleReportMessage : undefined}
+        onBlockSender={(chat.groupToken && !chat.lounge) || chat.forum ? handleBlockSender : undefined}
+        onRemoveMessage={isForumFounderThread ? handleRemoveMessage : undefined}
+        onBlockContact={!chat.groupToken && !chat.lounge && !chat.forum && chat.peerVeilId ? handleBlockContact : undefined}
         onBack={() => { setChat(null); setError(null); refreshSessions(); setScreen('main'); }}
-        onStartCall={chat.status !== 'ended' && chat.status !== 'pending' && !chat.groupToken ? () => {
+        onStartCall={chat.status !== 'ended' && chat.status !== 'pending' && !chat.groupToken && chat.myVerified && chat.peerVerified ? () => { // Batch F (R4-4-16): safety-code gate
           // b144 W3: 1:1 ready threads only — group calls are post-W4
           CallManager.start(chat.token, chat.title).catch((e) => console.log(`[veil-call] start failed: ${(e as Error).message}`));
         } : undefined}
@@ -4494,6 +5543,9 @@ function VeilApp() {
         onAllowDlChange={setAllowDl}
         onMediaSave={handleMediaSave}
         mediaSaving={mediaSaving}
+        inviteState={inviteState}
+        onJoinGroupInvite={handleJoinGroupInvite}
+        onDeclineGroupInvite={handleDeclineGroupInvite}
         onSendMedia={handleSendMedia}
         onCancelPick={handleCancelPick}
         onMediaRetry={(id) => {
@@ -4506,6 +5558,7 @@ function VeilApp() {
         onVoiceSend={handleVoiceSend}
         group={chat.groupToken && groupInfo ? {
           isCreator: groupInfo.isCreator,
+          forum: !!chat.forum || !!(FORUM_PIN && chat.groupToken === FORUM_PIN.groupToken), // Batch F (R4-2-01)
           epoch: groupInfo.epoch,
           fingerprint: groupInfo.fingerprint,
           members: groupInfo.members,
@@ -4558,7 +5611,7 @@ function VeilApp() {
       onOpenSession={handleOpenSession}
       onNewSession={() => setTab('contacts')}
       onCreateInvite={async () => {
-        if (!app || !identity) throw new Error('Create your Veil identity first — Settings → Identity.');
+        if (!app || !identity) throw new Error('Create your Vardum identity first — Settings → Identity.');
         const who = await clientId();
         if (!who) throw new Error('Sign in first.');
         const link = (await createInviteSession(
@@ -4590,6 +5643,12 @@ function VeilApp() {
       onVerify={handleVerifyPin}
       onSetNickname={handleNickname}
       onCreateGroup={handleCreateGroup}
+      onOpenContact={handleOpenContact}
+      myGroups={myGroups}
+      onAddGroupPeople={handleAddGroupPeople}
+      prefillAdd={prefillAdd}
+      blockedIds={[...blockedIds]}
+      onUnblock={handleUnblock}
       tab={tab}
       onTab={setTab}
       settings={settings}
@@ -4597,20 +5656,46 @@ function VeilApp() {
       onRunCheckup={() => { setOnboardingMode('checkupOnly'); setScreen('onboard'); }}
       onCreateTransfer={async () => {
         if (!app) throw new Error('App is not ready yet — try again in a moment.');
-        return createDeviceTransfer(
-          { sessions: app.sessions, vault: app.vault, relay: app.relay, webBaseUrl: VEIL_BASE_URL },
+        const t = await createDeviceTransfer(
+          { sessions: app.sessions, vault: app.vault, relay: app.relay, webBaseUrl: VEIL_BASE_URL, storage: app.storage },
           { clientId: identity?.veilId },
         );
+        // Batch C (B5, decision D3): a transfer is a MOVE — once the new phone
+        // has collected the bundle, this phone retires the moved chats (two
+        // phones holding the same session would fork it). Nothing is retired
+        // if the link expires unused.
+        // Batch E (F-3): the move is recorded on disk; an app kill before pickup
+        // is finished by the launch check (loadPendingTransfer) instead.
+        void finishTransferMove({ relay: app.relay, sessions: app.sessions, storage: app.storage }, { token: t.token, sessionTokens: t.sessionTokens, createdAt: Date.now() }).then(async ({ state, retired: n }) => {
+          if (state !== 'used') return;
+          refreshSessions();
+          Alert.alert('Moved to your new phone', n === 1 ? 'Your chat now lives on the new phone and has been removed from this one.' : `Your ${n} chats now live on the new phone and have been removed from this one.`);
+        }).catch(() => undefined);
+        return t;
       }}
       onReceiveTransfer={async (link: string) => {
         if (!app) throw new Error('App is not ready yet — try again in a moment.');
         const r = await receiveDeviceTransfer(
           { sessions: app.sessions, vault: app.vault, relay: app.relay, webBaseUrl: VEIL_BASE_URL },
           link,
+          {
+            // Batch D (D-10): the user sees the incoming Vardum ID before it becomes theirs
+            confirmIdentity: (veilId: string) => new Promise<boolean>((resolve) => Alert.alert(
+              'Import this identity?',
+              `This transfer carries the Vardum ID ${veilId}. Only continue if this is your own Vardum ID from your other phone.`,
+              [{ text: 'Cancel', style: 'cancel', onPress: () => resolve(false) }, { text: 'Import', onPress: () => resolve(true) }],
+              { cancelable: false },
+            )),
+          },
         );
         // refresh everything the import may have changed
         setIdentity(await app.vault.load());
         refreshSessions();
+        // Batch G (R5-3-03): something wasn't saved — no ack went out, so the old phone keeps its chats
+        if (r.incomplete) Alert.alert('Not everything was saved', 'This phone could not save everything from the transfer, so your old phone keeps its chats. Free up space here, then make a new transfer link on the old phone.');
+        // Batch H (round-6 review R6-1-04): imported, but the old phone keeps its copy
+        else if (r.ackHeld === 'different-identity') Alert.alert('Your old phone keeps its chats', 'This phone uses a different Vardum ID from the one in the transfer, so the moved chats can\u2019t be used here and your old phone keeps them.');
+        else if (r.ackHeld === 'already-here') Alert.alert('Your old phone keeps its chats', 'Some of these chats were already on this phone, so they were not replaced and your old phone keeps its copy. Remove them on the old phone yourself once you are sure this phone has everything.');
         return r;
       }}
       appLockEnabled={!!appLock}
@@ -4620,8 +5705,9 @@ function VeilApp() {
       onWipeDevice={handleWipeDevice}
       onDeleteAccount={handleDeleteAccount}
       onViewIntro={() => { setOnboardingMode('introOnly'); setScreen('onboard'); }}
-      webBaseUrl={VEIL_BASE_URL}
+      webBaseUrl={VEIL_SITE_URL}
       onVerifyPhrase={handleVerifyPhrase}
+      onSwitchToPhraseSignIn={handleSwitchToPhraseSignIn}
       onRemoveIdentity={handleRemoveIdentity}
       onGenerateNewVeilId={handleGenerateNewVeilId}
       onCreateIdentity={handleOpenIdentityFlow}
@@ -4641,11 +5727,11 @@ function VeilApp() {
 }
 
 const styles = StyleSheet.create({
-  safeArea: { flex: 1, backgroundColor: '#0b0f14' },
-  boot: { flex: 1, backgroundColor: '#0b0f14', alignItems: 'center', justifyContent: 'center', padding: 24 },
-  bootText: { color: '#5a6b76', marginTop: 14, fontSize: 13, letterSpacing: 1 },
+  safeArea: { flex: 1, backgroundColor: '#0B0B0F' },
+  boot: { flex: 1, backgroundColor: '#0B0B0F', alignItems: 'center', justifyContent: 'center', padding: 24 },
+  bootText: { color: '#5E6464', marginTop: 14, fontSize: 13, letterSpacing: 1 },
   errTitle: { color: '#ff6b6b', fontSize: 16, fontWeight: '700', marginBottom: 16, textAlign: 'center' },
-  errText: { color: '#9fb3c0', fontSize: 11, lineHeight: 16, textAlign: 'left' },
+  errText: { color: '#8E9696', fontSize: 11, lineHeight: 16, textAlign: 'left' },
 });
 
 class VeilErrorBoundary extends React.Component<{ children: React.ReactNode }, { msg: string | null }> {
@@ -4658,7 +5744,7 @@ class VeilErrorBoundary extends React.Component<{ children: React.ReactNode }, {
     if (this.state.msg) {
       return (
         <View style={styles.boot}>
-          <Text style={styles.errTitle}>VEIL hit an error — please screenshot this</Text>
+          <Text style={styles.errTitle}>Vardum hit an error — please screenshot this</Text>
           <Text style={styles.errText}>{this.state.msg}</Text>
         </View>
       );
@@ -4670,7 +5756,34 @@ class VeilErrorBoundary extends React.Component<{ children: React.ReactNode }, {
 
 const DEFAULTS = normalizeSettings(null);
 
+/** 21 Oct 2026 (build 67, owner: "a tiny bit too stretched"): targeting API 36
+ *  makes Android draw behind the status and navigation bars, and
+ *  react-native's SafeAreaView is iOS-only. On Android the root pads itself by
+ *  the real insets instead. */
+function AndroidSafeRoot({ children }: { children: React.ReactNode }) {
+  const insets = useSafeAreaInsets();
+  return (
+    <View
+      style={[styles.safeArea, { paddingTop: insets.top, paddingBottom: insets.bottom, paddingLeft: insets.left, paddingRight: insets.right }]}
+      onStartShouldSetResponderCapture={() => { veilActivityPing(); return false; }}
+    >
+      {children}
+    </View>
+  );
+}
+
 export default function App() {
+  if (Platform.OS === 'android') {
+    return (
+      <SafeAreaProvider>
+        <AndroidSafeRoot>
+          <VeilErrorBoundary>
+            <VeilApp />
+          </VeilErrorBoundary>
+        </AndroidSafeRoot>
+      </SafeAreaProvider>
+    );
+  }
   return (
     // BUG FIXED (Sept 19): no screen accounted for the notch / Dynamic Island
     // safe area, so header content (e.g. Settings/Sign-out in the top-right)
