@@ -12,17 +12,17 @@ Website: https://tryvardum.app
 
 - **End-to-end encryption.** Hybrid X25519 + ML-KEM-768 key exchange, double ratchet, forward secrecy per message. The relay stores ciphertext it cannot open.
 - **Deleted means deleted.** Burn after read (5 min to 24 h after opening), an expiry for unopened copies, and a wipe either person can trigger. Relay copies are hard-deleted, not hidden.
-- **Nothing-at-Rest.** Identity keys live in memory only. A locked phone fetches nothing and holds nothing to extract. Recovery is the 24-word phrase.
-- **Duress and decoy codes, off until you set them.** A decoy code opens a harmless dashboard. A duress code wipes local keys and server records, then shows the same decoy.
+- **Nothing-at-Rest.** Identity keys live in memory only. A locked phone fetches nothing and keeps much less on it to extract (not a guarantee against extraction tools or a compromised phone). Recovery is the 24-word phrase.
+- **Duress and decoy codes, off until you set them.** A decoy code opens a harmless dashboard. A duress code wipes local keys and asks the relay to delete your records, then shows the same decoy.
 - **No phone. No email. No name.** Your identity is 24 random words made on your phone. Your Vardum ID is random, and nothing you sign up with points back to you.
 - **Calls across networks.** Voice and video calls go through a call server Vardum runs itself, so neither phone learns the other's IP address. Connection details travel inside the encrypted call offer to cut setup time.
 - **Groups up to 100.** Post-quantum sender keys, rotation each epoch, signed membership, evictions that stick.
 - **Encrypted media, vaults and notes.** Per-file keys, a hidden vault volume, a 25 MB cap.
-- **Android without Google.** On GrapheneOS and other phones without Google services, alerts arrive through UnifiedPush (for example the ntfy app), encrypted to the phone and carrying no sender or content.
+- **Android without Google.** On GrapheneOS and other phones without Google services, alerts arrive through UnifiedPush (for example the ntfy app), encrypted to the phone and carrying no sender or content. Vardum is not affiliated with or endorsed by GrapheneOS.
 
 ## Honest limits
 
-- The cryptography is self-reviewed. An independent review is planned for early 2027; until it's published, nothing here has been independently checked.
+- The cryptography is self-reviewed. An independent cryptographic audit is planned for early 2027; until it's published, nothing here has been independently checked.
 - Calling across networks is new and has had limited testing. The call server sees both phones' IP addresses while a call runs, and when and for how long. If it can't be reached, calls work on the same network only.
 - The relay sees network metadata such as timing, sizes and the IP address of each request. Push services (Apple, Google, Expo, UnifiedPush servers) see the push address and when alerts are sent.
 - Android is a small-group beta, by request.
