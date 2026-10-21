@@ -16,6 +16,7 @@ import * as ImagePicker from 'expo-image-picker';
 import { holdAutoLock, withSystemSheet } from '../lock-hold';
 import * as FileSystem from 'expo-file-system';
 import * as MediaLibrary from 'expo-media-library';
+import { saveToChosenFolder, usesFolderPicker } from '../saved-media';
 import { Ionicons } from '@expo/vector-icons';
 import { useThemedPrompt } from './ThemedPrompt';
 import { useThemedChooser } from './ThemedSheets';
@@ -911,18 +912,29 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
       }
       lsbEmbed(img.rgba, await buildStegoStream(message, pass.trim() || null, img.rgba.length)); // Batch E (F-7)
       const out = encodePng(img);
-      // b92 F14 (b91 audit): FULL Photos access, not add-only. iOS write-only
-      // permission does NOT allow deleting assets, so stego images saved
-      // under it could NOT be removed by the duress wipe — they would
-      // survive a duress event against the "nothing survives" claim.
-      // Full access keeps the duress purge able to delete veil_saved_media.
-      const perm = await withSystemSheet(() => MediaLibrary.requestPermissionsAsync(false));
-      if (!perm.granted) { setErr('Photos access is required to save (and later purge under a duress wipe) the stego image.'); setBusy(false); return; }
-      const path = `${FileSystem.cacheDirectory}veil-stego-${Date.now()}.png`;
-      await FileSystem.writeAsStringAsync(path, bytesToB64(out), { encoding: FileSystem.EncodingType.Base64 });
-      const saved = (await MediaLibrary.saveToLibraryAsync(path)) as unknown as string | undefined;
-      await FileSystem.deleteAsync(path, { idempotent: true });
-      // (b64) track the Photos asset id — the duress wipe deletes these so
+      const viaFolder = usesFolderPicker();
+      let saved: string | undefined;
+      if (viaFolder) {
+        // b69 Android: "Save to…" through the system folder picker, no gallery
+        // permission. The folder grant persists, so the duress wipe can still
+        // delete this file (src/saved-media.ts).
+        const uri = await withSystemSheet(() => saveToChosenFolder(bytesToB64(out), `vardum-stego-${Date.now()}.png`, 'image/png'));
+        if (!uri) { setErr('Not saved. Choose a folder to save the stego image.'); setBusy(false); return; }
+        saved = uri;
+      } else {
+        // b92 F14 (b91 audit): FULL Photos access, not add-only. iOS write-only
+        // permission does NOT allow deleting assets, so stego images saved
+        // under it could NOT be removed by the duress wipe — they would
+        // survive a duress event against the "nothing survives" claim.
+        // Full access keeps the duress purge able to delete veil_saved_media.
+        const perm = await withSystemSheet(() => MediaLibrary.requestPermissionsAsync(false));
+        if (!perm.granted) { setErr('Photos access is required to save (and later purge under a duress wipe) the stego image.'); setBusy(false); return; }
+        const path = `${FileSystem.cacheDirectory}veil-stego-${Date.now()}.png`;
+        await FileSystem.writeAsStringAsync(path, bytesToB64(out), { encoding: FileSystem.EncodingType.Base64 });
+        saved = (await MediaLibrary.saveToLibraryAsync(path)) as unknown as string | undefined;
+        await FileSystem.deleteAsync(path, { idempotent: true });
+      }
+      // (b64) track the Photos asset id (b69: or the Android file URI) — the duress wipe deletes these so
       // stego images don't outlive the device data they belong to.
       try {
         if (saved && storage) {
@@ -932,13 +944,13 @@ function StegoView({ storage, choose, onEmbedded }: { storage?: VeilApp['storage
           await storage.set('veil_saved_media', JSON.stringify(arr));
         }
       } catch { /* tracking is best-effort */ }
-      setResult('Stego image saved to Photos. Send it like any picture — the words travel inside, invisible. Do not re-upload through apps that recompress.');
+      setResult(`Stego image saved ${viaFolder ? 'to the folder you chose' : 'to Photos'}. Send it like any picture — the words travel inside, invisible. Do not re-upload through apps that recompress.`);
       // show the result right here so it can be viewed, not just saved
       onEmbedded({
         name: `stego-${Date.now()}.png`,
         mime: 'image/png',
         bytes: out,
-        note: 'Saved to Photos. Looks like the original picture — the message is inside.',
+        note: `${viaFolder ? 'Saved to the folder you chose' : 'Saved to Photos'}. Looks like the original picture — the message is inside.`,
       });
       // AUDIT FIX (Sept 19): the passphrase (and message) stayed in the boxes
       // after a successful embed — a shoulder-surf/screen-lock risk once the

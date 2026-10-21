@@ -70,6 +70,7 @@ const veilActivityPing = () => { VEIL_LAST_ACTIVITY = Date.now(); };
 import { OnboardingScreen } from './screens/OnboardingScreen';
 import { AttributionSheet } from './screens/AttributionSheet';
 import { autoLockHeld, withSystemSheet, systemSheetExpected, expectSystemSheet } from './lock-hold';
+import { deleteSavedMedia, saveToChosenFolder, usesFolderPicker } from './saved-media';
 import { WelcomeScreen, fetchLoungePayload } from './screens/WelcomeScreen';
 import { type AppLockRecord, type LockoutState, MAX_ATTEMPTS } from '../vendor/device/src/applock';
 import { relayTimestampToIso } from '../vendor/device/src/time';
@@ -454,15 +455,13 @@ function VeilApp() {
   const naRWipeStorage = useCallback(async (): Promise<void> => {
     if (!app) return;
     try { await app.vault.onClose(); } catch { /* conversation layer, best-effort */ }
-    // stego images this app saved to Photos — tracked in veil_saved_media at
-    // save time; delete silently (same purge the duress wipe uses).
+    // stego images this app saved (Photos on iOS, the chosen folder on
+    // Android) — tracked in veil_saved_media at save time; delete silently
+    // (same purge the duress wipe uses).
     try {
       const rawIds = await app.storage.get('veil_saved_media');
       const ids = rawIds ? (JSON.parse(rawIds) as string[]) : [];
-      if (ids.length) {
-        const perm = await MediaLibrary.getPermissionsAsync();
-        if (perm.granted) { try { await MediaLibrary.deleteAssetsAsync(ids); } catch { /* best-effort */ } }
-      }
+      if (ids.length) await deleteSavedMedia(ids).catch(() => undefined);
     } catch { /* best-effort */ }
     // encrypted vault-container cache + stray temp files (outside the keychain)
     try {
@@ -1237,11 +1236,9 @@ function VeilApp() {
             }
           }
         },
-        deleteSavedMedia: async (ids) => {
-          // (b64) 4. stego images this app saved to Photos; never asks for permission
-          const perm = await MediaLibrary.getPermissionsAsync();
-          if (perm.granted) await MediaLibrary.deleteAssetsAsync(ids);
-        },
+        // (b64) 4. stego images this app saved (Photos on iOS, the chosen
+        // folder on Android, b69); never asks for permission
+        deleteSavedMedia: (ids) => deleteSavedMedia(ids),
         dropPushRegistration: (target) => dropPushRegistration(app, target), // Batch F (R4-4-17)
       });
       if (leftAfterWipe > 0) console.log(`[veil] wipe verify: ${leftAfterWipe} item(s) could not be removed`);
@@ -4492,14 +4489,24 @@ function VeilApp() {
     setMediaSaving((prev) => ({ ...prev, [msgId]: 'saving' }));
     let tmp: string | null = null;
     try {
+      const b64 = dataUri.slice(dataUri.indexOf(',') + 1);
+      const mime = orig.media.mime || 'image/jpeg';
+      const ext = mime.split('/')[1]?.split(';')[0] || 'jpg';
+      if (usesFolderPicker()) {
+        // b69 Android: "Save to…" through the system folder picker; no
+        // gallery permission. Cancelling the picker leaves the button as it was.
+        const saved = await withSystemSheet(() => saveToChosenFolder(b64, `vardum-${Date.now()}.${ext}`, mime));
+        setMediaSaving((prev) => {
+          if (saved) return { ...prev, [msgId]: 'saved' };
+          const next = { ...prev }; delete next[msgId]; return next;
+        });
+        return;
+      }
       // b92 F14 (b91 audit): full Photos access (NOT write-only) so the
       // duress purge can delete what the app saves — write-only saves
       // survived a duress wipe.
       const perm = await withSystemSheet(() => MediaLibrary.requestPermissionsAsync(false));
       if (!perm.granted) throw new Error('Photos permission was not granted.');
-      const b64 = dataUri.slice(dataUri.indexOf(',') + 1);
-      const mime = orig.media.mime || 'image/jpeg';
-      const ext = mime.split('/')[1]?.split(';')[0] || 'jpg';
       tmp = `${FileSystem.cacheDirectory}veil-save-${Date.now()}.${ext}`;
       await FileSystem.writeAsStringAsync(tmp, b64, { encoding: FileSystem.EncodingType.Base64 });
       await MediaLibrary.saveToLibraryAsync(tmp);

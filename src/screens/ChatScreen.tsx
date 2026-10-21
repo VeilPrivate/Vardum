@@ -8,6 +8,9 @@ import * as Clipboard from 'expo-clipboard';
 import { useThemedChooser } from './ThemedSheets';
 import { useThemedPrompt } from './ThemedPrompt';
 
+// b69: Android saves through the system folder picker (no gallery permission)
+const SAVE_MEDIA_LABEL = Platform.OS === 'android' ? 'Save to…' : 'Save to Photos';
+
 /** b199: media error marker for a file the relay no longer has (404). */
 export const MEDIA_GONE = 'gone';
 
@@ -289,7 +292,7 @@ const MessageRow = memo(function MessageRow({
                 disabled={saveState === 'saving' || saveState === 'saved'}
               >
                 <Text style={styles.saveBtnTxt}>
-                  {saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved ✓' : saveState === 'error' ? 'Save failed — tap to retry' : 'Save to Photos'}
+                  {saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved ✓' : saveState === 'error' ? 'Save failed — tap to retry' : SAVE_MEDIA_LABEL}
                 </Text>
               </TouchableOpacity>
             ) : null}
@@ -309,7 +312,7 @@ const MessageRow = memo(function MessageRow({
               disabled={saveState === 'saving' || saveState === 'saved'}
             >
               <Text style={styles.saveBtnTxt}>
-                {saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved ✓' : saveState === 'error' ? 'Save failed — tap to retry' : 'Save to Photos'}
+                {saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved ✓' : saveState === 'error' ? 'Save failed — tap to retry' : SAVE_MEDIA_LABEL}
               </Text>
             </TouchableOpacity>
           ) : null}
