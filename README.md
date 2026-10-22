@@ -8,6 +8,10 @@ Vardum (formerly VEIL) is an end-to-end encrypted messenger for iPhone and Andro
 
 Website: https://tryvardum.app
 
+## News
+
+**October 2026:** VEIL is now Vardum. Final iPhone native beta build: https://testflight.apple.com/join/Aqay7XH2 · Android beta: 12 spots, email matt@tryvardum.app, or download for GrapheneOS Hardened "Graph": https://tryvardum.app/android/ · Everything else: https://tryvardum.app · Claims: https://tryvardum.app/claims/
+
 ## What it does
 
 - **End-to-end encryption.** Hybrid X25519 + ML-KEM-768 key exchange, double ratchet, forward secrecy per message. The relay stores ciphertext it cannot open.
